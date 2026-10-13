@@ -1,0 +1,517 @@
+use super::*;
+use crate::runner_protocol::{
+    RunnerCapabilities, RunnerPollRequest, RunnerProjectSummary, RunnerRegisterRequest,
+    RunnerResultRequest,
+};
+use base64::engine::general_purpose;
+use sha2::{Digest, Sha256};
+
+#[test]
+fn mcp_gateway_tool_call_params_do_not_retain_outer_meta() {
+    for meta in [
+        json!({"progressToken": "legacy-progress", "custom": {"private": true}}),
+        json!({
+            "io.modelcontextprotocol/protocolVersion": MCP_STATELESS_PROTOCOL_VERSION,
+            "io.modelcontextprotocol/clientCapabilities": {"extensions": {}},
+            "io.modelcontextprotocol/clientInfo": {"name": "outer-host", "version": "2026"},
+            "openai/session": "chat-session-opaque-value"
+        }),
+    ] {
+        let parsed: McpToolCallParams = serde_json::from_value(json!({
+            "name": crate::mcp_gateway::MCP_TOOL_NAME,
+            "arguments": {"action": "list"},
+            "_meta": meta
+        }))
+        .unwrap();
+        let McpToolCallParams { name, arguments } = parsed;
+        assert_eq!(name, crate::mcp_gateway::MCP_TOOL_NAME);
+        assert_eq!(arguments, json!({"action": "list"}));
+    }
+}
+
+#[test]
+fn mcp_tool_action_audit_ids_keep_successful_business_session_internal_and_bounded() {
+    let mut correlation = crate::tool_runtime::ToolCallCorrelation::default();
+    correlation.business_session_id = Some("wc_sess_AAAAAAAAAAAAAAAA".to_string());
+    let ids = mcp_tool_action_audit_ids(true, Some("wc_goal_BBBBBBBBBBBBBBBB"), &correlation, None)
+        .expect("successful bounded ids");
+    assert_eq!(ids["business_session_id"], "wc_sess_AAAAAAAAAAAAAAAA");
+    assert_eq!(ids["goal_id"], "wc_goal_BBBBBBBBBBBBBBBB");
+    assert_eq!(ids.as_object().unwrap().len(), 2);
+    assert!(
+        mcp_tool_action_audit_ids(false, Some("wc_goal_BBBBBBBBBBBBBBBB"), &correlation, None,)
+            .is_none()
+    );
+
+    correlation.business_session_id = None;
+    assert_eq!(
+        mcp_tool_action_audit_ids(true, Some("wc_goal_BBBBBBBBBBBBBBBB"), &correlation, None,),
+        Some(json!({"goal_id": "wc_goal_BBBBBBBBBBBBBBBB"}))
+    );
+    assert!(mcp_tool_action_audit_ids(true, None, &correlation, None).is_none());
+}
+
+#[test]
+fn mcp_job_audit_correlation_keeps_only_stable_job_identity() {
+    let handoff = json!({
+        "result": {
+            "structuredContent": {
+                "success": true,
+                "output": {
+                    "promoted_to_job": true,
+                    "job_id": "wc_job_background_123",
+                    "observation_token": "opaque-token-must-not-be-recorded"
+                }
+            }
+        }
+    });
+    let correlated = mcp_tool_job_audit_correlation(Some("cargo_test"), &handoff);
+    assert_eq!(
+        correlated.async_job_id.as_deref(),
+        Some("wc_job_background_123")
+    );
+    assert!(correlated.observed_job_ids.is_empty());
+
+    let sparse_pending = json!({
+        "result": {
+            "structuredContent": {
+                "success": true,
+                "output": {
+                    "execution_state": "pending",
+                    "continuation": {
+                        "tool": "observe_jobs",
+                        "arguments": {"items": [{"job_id": "wc_job_sparse_pending_123"}]}
+                    }
+                }
+            }
+        }
+    });
+    let correlated = mcp_tool_job_audit_correlation(Some("run_process"), &sparse_pending);
+    assert_eq!(
+        correlated.async_job_id.as_deref(),
+        Some("wc_job_sparse_pending_123"),
+        "model-sparse pending handoff must retain originating Job identity in ActionAudit"
+    );
+
+    let observed = json!({
+        "result": {
+            "structuredContent": {
+                "success": true,
+                "output": {
+                    "items": [
+                        {"job_id": "wc_job_background_123", "project": "agent:special:demo", "observation_token": "one"},
+                        {"job_id": "wc_job_second_456", "project": "agent:special:demo", "observation_token": "two"},
+                        {"job_id": "wc_job_background_123", "project": "agent:special:demo", "observation_token": "duplicate"},
+                        {"job_id": "../unsafe"}
+                    ]
+                }
+            }
+        }
+    });
+    let correlated = mcp_tool_job_audit_correlation(Some("observe_jobs"), &observed);
+    assert_eq!(
+        correlated.observed_job_ids,
+        vec![
+            "wc_job_background_123".to_string(),
+            "wc_job_second_456".to_string()
+        ]
+    );
+    assert!(correlated.async_job_id.is_none());
+    assert_eq!(
+        correlated.resolved_project.as_deref(),
+        Some("agent:special:demo")
+    );
+
+    let mixed_projects = json!({
+        "result": {"structuredContent": {"success": true, "output": {"items": [
+            {"job_id": "wc_job_background_123", "project": "agent:special:demo"},
+            {"job_id": "wc_job_second_456", "project": "agent:special:other"}
+        ]}}}
+    });
+    assert!(
+        mcp_tool_job_audit_correlation(Some("observe_jobs"), &mixed_projects)
+            .resolved_project
+            .is_none(),
+        "a multi-Project observe_jobs call must not be assigned to one Project"
+    );
+
+    let ids = mcp_tool_action_audit_ids(
+        true,
+        None,
+        &crate::tool_runtime::ToolCallCorrelation::default(),
+        Some(&correlated),
+    )
+    .unwrap();
+    assert_eq!(
+        ids,
+        json!({"observed_job_ids":["wc_job_background_123","wc_job_second_456"]})
+    );
+    assert!(!ids.to_string().contains("token"));
+}
+
+#[test]
+fn work_result_app_internal_tools_do_not_start_live_window_activity() {
+    for tool in [
+        "present_work_result",
+        "work_result_thread_panel",
+        "get_work_result_state",
+        "read_work_result_activity_detail",
+        "send_work_result_message",
+        "read_changed_file_diff",
+    ] {
+        assert!(work_result_app_internal_tool(Some(tool)), "{tool}");
+    }
+    for tool in [
+        "get_runtime_status",
+        "read_current_window_activity",
+        "observe_jobs",
+        "read_files",
+    ] {
+        assert!(!work_result_app_internal_tool(Some(tool)), "{tool}");
+    }
+    assert!(!work_result_app_internal_tool(None));
+}
+
+fn test_runtime() -> ToolRuntime {
+    ToolRuntime::new_for_tests()
+}
+
+/// Build a runtime with an explicit MCP startup snapshot, so tests assert the
+/// frozen values instead of holding process-global env guards across requests.
+fn test_runtime_with_mcp_snapshot(
+    compact_schemas: bool,
+    apps_enabled: bool,
+    text_json_compat_enabled: bool,
+) -> ToolRuntime {
+    ToolRuntime::new(
+        std::sync::Arc::new(crate::runner_http::RunnerRegistry::default()),
+        std::sync::Arc::new(crate::tool_runtime::RuntimeInfo {
+            mcp_compact_schemas: compact_schemas,
+            mcp_apps_enabled: apps_enabled,
+            mcp_text_json_compat_enabled: text_json_compat_enabled,
+            ..Default::default()
+        }),
+    )
+}
+
+fn test_runtime_with_mcp_settings(compact_schemas: bool, apps_enabled: bool) -> ToolRuntime {
+    test_runtime_with_mcp_snapshot(compact_schemas, apps_enabled, false)
+}
+
+fn test_runtime_with_public_url(public_url: &str) -> ToolRuntime {
+    let runtime_info = crate::tool_runtime::RuntimeInfo {
+        configured_public_url: Some(public_url.to_string()),
+        ..Default::default()
+    };
+    ToolRuntime::new(
+        std::sync::Arc::new(crate::runner_http::RunnerRegistry::default()),
+        std::sync::Arc::new(runtime_info),
+    )
+}
+
+fn start_authorized_test_session(
+    runtime: &ToolRuntime,
+    auth: &crate::auth::AuthContext,
+    mode: crate::tool_runtime::SessionMode,
+) -> crate::tool_runtime::SessionSummary {
+    let fingerprint = crate::tool_runtime::workflow_session_authority_fingerprint(Some(auth))
+        .expect("test authority must have a stable identity");
+    runtime
+        .sessions
+        .start_session_with_options(
+            crate::tool_runtime::SessionCreateOptions::new(
+                None,
+                Some("specialized governance test".to_string()),
+                mode,
+                crate::tool_runtime::SessionGuards::default(),
+            )
+            .with_owner_authority_fingerprint(Some(fingerprint)),
+        )
+        .unwrap()
+}
+
+fn rpc(method: &str, id: Option<Value>, params: Value) -> JsonRpcRequest {
+    JsonRpcRequest {
+        jsonrpc: Some("2.0".to_string()),
+        method: method.to_string(),
+        params,
+        id,
+    }
+}
+
+fn adaptive_runtime_gateway_params(tool: &str, arguments: Value) -> Value {
+    json!({
+        "name": crate::mcp::tools::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME,
+        "arguments": {"tool": tool, "arguments": arguments}
+    })
+}
+
+fn mcp_2026_params(mut params: Value) -> Value {
+    params
+        .as_object_mut()
+        .expect("MCP params must be an object")
+        .insert(
+            "_meta".to_string(),
+            json!({
+                "io.modelcontextprotocol/protocolVersion": MCP_STATELESS_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }),
+        );
+    params
+}
+
+fn mcp_2026_ui_params(mut params: Value) -> Value {
+    params
+        .as_object_mut()
+        .expect("MCP params must be an object")
+        .insert(
+            "_meta".to_string(),
+            json!({
+                "io.modelcontextprotocol/protocolVersion": MCP_STATELESS_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {
+                    "extensions": {
+                        MCP_UI_EXTENSION: {
+                            "mimeTypes": [MCP_UI_RESOURCE_MIME_TYPE]
+                        }
+                    }
+                }
+            }),
+        );
+    params
+}
+
+fn mcp_export_api_auth(api_key_id: &str, username: &str) -> crate::auth::AuthContext {
+    let mut auth = crate::auth::AuthContext::new(crate::auth::AuthKind::ApiToken);
+    auth.username = Some(username.to_string());
+    auth.api_key_id = Some(api_key_id.to_string());
+    auth.token_kind = Some("user".to_string());
+    auth.scopes = vec![
+        crate::auth::SCOPE_RUNTIME_READ.to_string(),
+        crate::auth::SCOPE_PROJECT_READ.to_string(),
+    ];
+    auth
+}
+
+#[path = "mcp_tests/agent_continuation_app.rs"]
+mod agent_continuation_app;
+#[path = "mcp_tests/artifact_export.rs"]
+mod artifact_export;
+#[path = "mcp_tests/computer_app.rs"]
+mod computer_app;
+#[path = "mcp_tests/conformance.rs"]
+mod conformance;
+#[path = "mcp_tests/execution_control.rs"]
+mod execution_control;
+#[path = "mcp_tests/execution_feedback.rs"]
+mod execution_feedback;
+#[path = "mcp_tests/file_import.rs"]
+mod file_import;
+#[path = "mcp_tests/goal_plan_app.rs"]
+mod goal_plan_app;
+#[path = "mcp_tests/http_transport.rs"]
+mod http_transport;
+#[path = "mcp_tests/invocation_envelope.rs"]
+mod invocation_envelope;
+#[path = "mcp_tests/job_terminal_continuation_app.rs"]
+mod job_terminal_continuation_app;
+#[path = "mcp_tests/model_ergonomics.rs"]
+mod model_ergonomics;
+#[path = "mcp_tests/model_surface.rs"]
+mod model_surface;
+#[path = "mcp_tests/oauth_scope.rs"]
+mod oauth_scope;
+#[path = "mcp_tests/pdf_document_app.rs"]
+mod pdf_document_app;
+#[path = "mcp_tests/plugin_check.rs"]
+mod plugin_check;
+#[path = "mcp_tests/plugin_tools.rs"]
+mod plugin_tools;
+#[path = "mcp_tests/protocol.rs"]
+mod protocol;
+#[path = "mcp_tests/request_policy.rs"]
+mod request_policy;
+#[path = "mcp_tests/resource_references.rs"]
+mod resource_references;
+#[path = "mcp_tests/response.rs"]
+mod response_tests;
+#[path = "mcp_tests/result_app.rs"]
+mod result_app;
+#[path = "mcp_tests/runtime_tools.rs"]
+mod runtime_tools;
+#[path = "mcp_tests/ssh_resource.rs"]
+mod ssh_resource;
+#[path = "mcp_tests/structured_failure.rs"]
+mod structured_failure;
+#[path = "mcp_tests/tools.rs"]
+mod tools;
+#[path = "mcp_tests/work_result_app.rs"]
+mod work_result_app;
+
+// =========================================================================
+// HTTP integration tests — exercise the real Salvo router + AuthMiddleware.
+// These do not start a real server; they build a Router, wrap it in a
+// Service, and dispatch TestClient requests through it.
+// =========================================================================
+
+use crate::test_support::{seed_oauth_client, seed_user, test_config, test_config_oauth2, test_db};
+use salvo::test::{ResponseExt, TestClient};
+use salvo::Service;
+
+fn seed_oauth_access_token(
+    db: &crate::Database,
+    client: &crate::models::OAuthClientRecord,
+    user: &crate::models::UserRecord,
+    scopes: &str,
+) -> String {
+    let now = chrono::Utc::now().timestamp();
+    let plaintext = crate::auth::generate_oauth_access_token();
+    let record = crate::models::OAuthAccessTokenRecord {
+        // Fixture input describes effective authority; public storage excludes admin.
+        admin_authority: scopes.split_whitespace().any(|scope| scope == "admin"),
+        id: uuid::Uuid::new_v4().to_string(),
+        token_hash: crate::auth::hash_token(&plaintext),
+        client_id: client.client_id.clone(),
+        subject_kind: "managed_user".to_string(),
+        subject_id: user.id.clone(),
+        user_id: Some(user.id.clone()),
+        scopes: scopes
+            .split_whitespace()
+            .filter(|scope| *scope != "admin")
+            .collect::<Vec<_>>()
+            .join(" "),
+        resource: None,
+        shared_key_hash: None,
+        created_at: now,
+        expires_at: now + 3600,
+        revoked_at: None,
+        last_used_at: None,
+    };
+    db.insert_oauth_access_token(&record).unwrap();
+    plaintext
+}
+
+/// Build a minimal Router matching the production /mcp wiring: Config,
+/// Database, and ToolRuntime are injected so AuthMiddleware and mcp_post
+/// resolve state exactly as in `main.rs`.
+fn build_test_router(
+    config: Arc<crate::Config>,
+    db: Arc<crate::Database>,
+    runtime: Arc<ToolRuntime>,
+) -> Router {
+    Router::new()
+        .hoop(affix_state::inject(config))
+        .hoop(affix_state::inject(db))
+        .hoop(affix_state::inject(runtime))
+        .push(
+            Router::with_path("mcp")
+                .hoop(crate::AuthMiddleware)
+                .get(mcp_info)
+                .post(mcp_post),
+        )
+}
+
+/// Effective HTTP status: the explicitly set status_code, or OK when the
+/// handler only rendered a body (Salvo defaults Json bodies to 200).
+fn effective_status(resp: &Response) -> StatusCode {
+    resp.status_code.unwrap_or(StatusCode::OK)
+}
+
+async fn oauth_mcp_request(
+    service: &Service,
+    token: &str,
+    method: &str,
+    params: Value,
+) -> (StatusCode, Value, Option<String>) {
+    let stateless_2026 = request_protocol_version(&params) == Some(MCP_STATELESS_PROTOCOL_VERSION);
+    let tool_name = (method == "tools/call")
+        .then(|| {
+            params
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .flatten();
+    let mut request = TestClient::post("http://localhost/mcp").bearer_auth(token);
+    if stateless_2026 {
+        request = request
+            .add_header(
+                MCP_PROTOCOL_VERSION_HEADER,
+                MCP_STATELESS_PROTOCOL_VERSION,
+                true,
+            )
+            .add_header(MCP_METHOD_HEADER, method, true);
+        if let Some(tool_name) = tool_name.as_deref() {
+            request = request.add_header(MCP_NAME_HEADER, tool_name, true);
+        }
+    }
+    let mut resp = request
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": method,
+            "params": params,
+        }))
+        .send(service)
+        .await;
+    let status = effective_status(&resp);
+    let challenge = resp
+        .headers()
+        .get("www-authenticate")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let body = resp.take_json::<Value>().await.unwrap();
+    (status, body, challenge)
+}
+
+#[test]
+fn readiness_audit_correlation_retains_exact_jobs_without_guessing_project() {
+    let body = json!({"result":{"structuredContent":{"success":true,"output":{
+        "wait_state":"ready", "ready":[{"job_id":"wc_job_A","status":"completed","outcome":"succeeded"}],
+        "pending_job_ids":["wc_job_B"], "project":"untrusted-guess"
+    }}}});
+    let correlation = mcp_tool_job_audit_correlation(Some("wait_for_job_readiness"), &body);
+    assert_eq!(correlation.observed_job_ids, vec!["wc_job_A", "wc_job_B"]);
+    assert!(correlation.resolved_project.is_none());
+    assert!(correlation.async_job_id.is_none());
+}
+
+#[path = "mcp_tests/workbench_app.rs"]
+mod workbench_app;
+
+#[path = "mcp_tests/work_result_thread_empty.rs"]
+mod work_result_thread_empty;
+
+#[path = "mcp_tests/resource_mentions.rs"]
+mod resource_mentions;
+
+#[path = "mcp_tests/retired_app_resources.rs"]
+mod retired_app_resources;
+
+// Stateless App policy fixture. Window-aware carrier tests keep their own explicit identity.
+async fn handle_with_app_policy(
+    runtime: &ToolRuntime,
+    request: JsonRpcRequest,
+    auth: Option<&crate::auth::AuthContext>,
+    enabled: bool,
+) -> McpOutcome {
+    let protocol_era = super::inferred_protocol_era(&request);
+    super::handle_mcp_request_with_lifecycle(
+        runtime,
+        request,
+        auth,
+        protocol_era,
+        super::HostFileImportTrust::Untrusted,
+        None,
+        None,
+        None,
+        crate::model_surface::effective_mcp_compact_schemas(
+            crate::config::mcp_compact_schemas_override(),
+        ),
+        enabled,
+        None,
+    )
+    .await
+}
+
+#[path = "mcp_tests/docx_document_app.rs"]
+mod docx_document_app;

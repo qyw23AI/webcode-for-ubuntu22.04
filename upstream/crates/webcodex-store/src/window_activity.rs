@@ -1,0 +1,1094 @@
+use crate::models::{
+    WindowActivityEventRecord, WindowActivitySummaryRecord, WindowSessionLinkSummaryRecord,
+    WindowWorkflowAffinityRecord, WindowWorkflowLinkRecord, WindowWorkflowSessionSummaryRecord,
+};
+use crate::Database;
+use rusqlite::{params, Connection};
+use std::collections::{BTreeSet, HashMap};
+use webcodex_core::workflow_session_contract::is_safe_job_id;
+
+// Window history is already bounded by ActionAudit retention. Keep the human
+// console able to inspect the retained set instead of imposing tiny UI-only caps.
+pub const MAX_WINDOW_ACTIVITY_LIMIT: usize = 2_000;
+pub const MAX_WINDOW_LINK_LIMIT: usize = 2_000;
+
+fn bounded_limit(limit: usize, max: usize) -> i64 {
+    limit.clamp(1, max) as i64
+}
+
+fn principal_predicate<'a>(
+    principal: Option<(&'a str, &'a str)>,
+) -> (&'static str, Option<&'a str>, Option<&'a str>) {
+    match principal {
+        Some((kind, id)) => (
+            "AND e.principal_correlation_kind = ?2 AND e.principal_correlation_id = ?3",
+            Some(kind),
+            Some(id),
+        ),
+        None => ("", None, None),
+    }
+}
+
+impl Database {
+    /// Bounded newest-first Window summaries. `principal=None` is reserved for
+    /// callers that already hold canonical runtime-wide administrator/bootstrap
+    /// authority; knowing a Window key never bypasses this filter.
+    pub fn list_window_activity_summaries(
+        &self,
+        principal: Option<(&str, &str)>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<WindowActivitySummaryRecord>> {
+        let conn = self.lock_history_connection(crate::StoreDomain::WindowActivity)?;
+        let (principal_sql, kind, id) = principal_predicate(principal);
+        let sql = format!(
+            "SELECT e.client_window_key,
+                    MAX(e.client_window_source),
+                    MIN(e.window_ended_at_ms),
+                    MAX(e.window_ended_at_ms),
+                    MAX(CASE WHEN e.action_name = 'toolsCall' THEN e.window_ended_at_ms END),
+                    MAX(CASE WHEN e.window_meaningful = 1 THEN e.window_ended_at_ms END),
+                    COUNT(DISTINCT l.workflow_session_id),
+                    COUNT(DISTINCT CASE WHEN e.recorder_gap_session_id IS NOT NULL THEN e.event_id END)
+             FROM action_events e
+             LEFT JOIN action_event_workflow_links l ON l.event_id = e.event_id
+             WHERE e.client_window_key IS NOT NULL
+               AND e.window_ended_at_ms IS NOT NULL
+               {principal_sql}
+             GROUP BY e.client_window_key
+             ORDER BY MAX(e.window_ended_at_ms) DESC, e.client_window_key ASC
+             LIMIT ?1"
+        );
+        let limit = bounded_limit(limit, MAX_WINDOW_LINK_LIMIT);
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = match (kind, id) {
+            (Some(kind), Some(id)) => stmt.query(params![limit, kind, id])?,
+            _ => stmt.query(params![limit])?,
+        };
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(WindowActivitySummaryRecord {
+                client_window_key: row.get(0)?,
+                client_window_source: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                first_seen_at_ms: row.get(2)?,
+                last_seen_at_ms: row.get(3)?,
+                last_tool_call_at_ms: row.get(4)?,
+                last_meaningful_activity_at_ms: row.get(5)?,
+                linked_session_count: usize::try_from(row.get::<_, i64>(6)?).unwrap_or(usize::MAX),
+                recorder_gap_count: usize::try_from(row.get::<_, i64>(7)?).unwrap_or(usize::MAX),
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn count_window_activity_summaries(
+        &self,
+        principal: Option<(&str, &str)>,
+    ) -> anyhow::Result<usize> {
+        let conn = self.lock_history_connection(crate::StoreDomain::WindowActivity)?;
+        let count = match principal {
+            Some((kind, id)) => conn.query_row(
+                "SELECT COUNT(DISTINCT client_window_key)
+                 FROM action_events
+                 WHERE client_window_key IS NOT NULL
+                   AND window_ended_at_ms IS NOT NULL
+                   AND principal_correlation_kind = ?1
+                   AND principal_correlation_id = ?2",
+                params![kind, id],
+                |row| row.get::<_, i64>(0),
+            )?,
+            None => conn.query_row(
+                "SELECT COUNT(DISTINCT client_window_key)
+                 FROM action_events
+                 WHERE client_window_key IS NOT NULL
+                   AND window_ended_at_ms IS NOT NULL",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
+        };
+        Ok(usize::try_from(count).unwrap_or(usize::MAX))
+    }
+
+    pub fn get_window_activity_summary(
+        &self,
+        window_key: &str,
+        principal: Option<(&str, &str)>,
+    ) -> anyhow::Result<Option<WindowActivitySummaryRecord>> {
+        let conn = self.lock_history_connection(crate::StoreDomain::WindowActivity)?;
+        let row = match principal {
+            Some((kind, id)) => conn
+                .query_row(
+                    "SELECT e.client_window_key, MAX(e.client_window_source),
+                            MIN(e.window_ended_at_ms),
+                            MAX(e.window_ended_at_ms),
+                            MAX(CASE WHEN e.action_name = 'toolsCall' THEN e.window_ended_at_ms END),
+                            MAX(CASE WHEN e.window_meaningful = 1 THEN e.window_ended_at_ms END),
+                            COUNT(DISTINCT l.workflow_session_id),
+                            COUNT(DISTINCT CASE WHEN e.recorder_gap_session_id IS NOT NULL THEN e.event_id END)
+                     FROM action_events e
+                     LEFT JOIN action_event_workflow_links l ON l.event_id = e.event_id
+                     WHERE e.client_window_key = ?1
+                       AND e.window_ended_at_ms IS NOT NULL
+                       AND e.principal_correlation_kind = ?2
+                       AND e.principal_correlation_id = ?3
+                     GROUP BY e.client_window_key",
+                    params![window_key, kind, id],
+                    window_summary_from_row,
+                )
+                .optional()?,
+            None => conn
+                .query_row(
+                    "SELECT e.client_window_key, MAX(e.client_window_source),
+                            MIN(e.window_ended_at_ms),
+                            MAX(e.window_ended_at_ms),
+                            MAX(CASE WHEN e.action_name = 'toolsCall' THEN e.window_ended_at_ms END),
+                            MAX(CASE WHEN e.window_meaningful = 1 THEN e.window_ended_at_ms END),
+                            COUNT(DISTINCT l.workflow_session_id),
+                            COUNT(DISTINCT CASE WHEN e.recorder_gap_session_id IS NOT NULL THEN e.event_id END)
+                     FROM action_events e
+                     LEFT JOIN action_event_workflow_links l ON l.event_id = e.event_id
+                     WHERE e.client_window_key = ?1
+                       AND e.window_ended_at_ms IS NOT NULL
+                     GROUP BY e.client_window_key",
+                    params![window_key],
+                    window_summary_from_row,
+                )
+                .optional()?,
+        };
+        Ok(row)
+    }
+
+    pub fn list_window_activity_events(
+        &self,
+        window_key: &str,
+        principal: Option<(&str, &str)>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<WindowActivityEventRecord>> {
+        #[cfg(any(test, feature = "root-test-support"))]
+        self.window_history_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut reader = self.lock_history_connection(crate::StoreDomain::WindowActivity)?;
+        let conn = reader.transaction()?;
+        let (principal_sql, kind, id) = principal_predicate(principal);
+        let sql = format!(
+            "SELECT e.event_id, e.client_window_key, e.client_window_source,
+                    e.server_trace_id, e.window_started_at_ms, e.window_ended_at_ms,
+                    e.duration_ms, e.action_name, e.operation, e.project, e.status,
+                    e.window_meaningful, e.recorder_gap_session_id,
+                    e.principal_correlation_kind, e.principal_correlation_id,
+                    e.request_observed_at_ms, e.response_handed_at_ms,
+                    e.window_transition_kind, e.response_streaming,
+                    e.window_continuity_eligible, e.http_status, e.ids_json,
+                    CASE WHEN e.principal_kind='oauth2' AND e.principal_correlation_kind='oauth2'
+                        THEN e.principal_user_id END AS oauth_user,
+                    CASE WHEN e.principal_kind='oauth2' AND e.principal_correlation_kind='oauth2'
+                        THEN e.oauth_client_id END AS oauth_client,
+                    CASE WHEN json_valid(e.summary_json) THEN
+                      CASE json_extract(e.summary_json, '$.failure_expectation_result')
+                        WHEN 'matched_expected_failure' THEN 'matched_expected_failure'
+                        WHEN 'matched_expected_result' THEN 'matched_expected_result'
+                        WHEN 'unexpected_failure' THEN 'unexpected_failure'
+                        WHEN 'expectation_mismatch' THEN 'expectation_mismatch'
+                        WHEN 'unexpected_success' THEN 'unexpected_success'
+                      END
+                    END
+             FROM action_events e
+             WHERE e.client_window_key = ?1
+               AND e.window_started_at_ms IS NOT NULL
+               AND e.window_ended_at_ms IS NOT NULL
+               {principal_sql}
+             ORDER BY COALESCE(e.request_observed_at_ms, e.window_started_at_ms) DESC, e.event_id DESC
+             LIMIT ?4"
+        );
+        let limit = bounded_limit(limit, MAX_WINDOW_ACTIVITY_LIMIT);
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = match (kind, id) {
+            (Some(kind), Some(id)) => stmt.query(params![window_key, kind, id, limit])?,
+            _ => {
+                let sql = sql.replace("LIMIT ?4", "LIMIT ?2");
+                drop(stmt);
+                let mut stmt = conn.prepare(&sql)?;
+                let records =
+                    collect_window_events(&conn, &mut stmt, params![window_key, limit], None)?;
+                return Ok(records);
+            }
+        };
+        collect_window_event_rows(&conn, &mut rows, None)
+    }
+
+    /// Latest successful action in the exact principal's Window. Filter before
+    /// limiting so unrelated activity cannot hide the selected presentation.
+    /// The caller still owns current Project and Session authorization.
+    pub fn latest_successful_window_action(
+        &self,
+        window_key: &str,
+        principal: (&str, &str),
+        operation: &str,
+    ) -> anyhow::Result<Option<WindowActivityEventRecord>> {
+        let conn = self.lock_connection(crate::StoreDomain::WindowActivity);
+        let mut stmt = conn.prepare(
+            "SELECT e.event_id, e.client_window_key, e.client_window_source,
+                    e.server_trace_id, e.window_started_at_ms, e.window_ended_at_ms,
+                    e.duration_ms, e.action_name, e.operation, e.project, e.status,
+                    e.window_meaningful, e.recorder_gap_session_id,
+                    e.principal_correlation_kind, e.principal_correlation_id,
+                    e.request_observed_at_ms, e.response_handed_at_ms,
+                    e.window_transition_kind, e.response_streaming,
+                    e.window_continuity_eligible, e.http_status, e.ids_json,
+                    CASE WHEN e.principal_kind='oauth2' AND e.principal_correlation_kind='oauth2'
+                        THEN e.principal_user_id END AS oauth_user,
+                    CASE WHEN e.principal_kind='oauth2' AND e.principal_correlation_kind='oauth2'
+                        THEN e.oauth_client_id END AS oauth_client,
+                    CASE WHEN json_valid(e.summary_json) THEN
+                      CASE json_extract(e.summary_json, '$.failure_expectation_result')
+                        WHEN 'matched_expected_failure' THEN 'matched_expected_failure'
+                        WHEN 'matched_expected_result' THEN 'matched_expected_result'
+                        WHEN 'unexpected_failure' THEN 'unexpected_failure'
+                        WHEN 'expectation_mismatch' THEN 'expectation_mismatch'
+                        WHEN 'unexpected_success' THEN 'unexpected_success'
+                      END
+                    END
+             FROM action_events e
+             WHERE e.client_window_key = ?1
+               AND e.principal_correlation_kind = ?2
+               AND e.principal_correlation_id = ?3
+               AND e.operation = ?4 AND e.status = 'success'
+               AND e.project IS NOT NULL
+               AND e.window_started_at_ms IS NOT NULL
+               AND e.window_ended_at_ms IS NOT NULL
+             ORDER BY COALESCE(e.request_observed_at_ms, e.window_started_at_ms) DESC, e.event_id DESC
+             LIMIT 1",
+        )?;
+        Ok(collect_window_events(
+            &conn,
+            &mut stmt,
+            params![window_key, principal.0, principal.1, operation],
+            None,
+        )?
+        .pop())
+    }
+
+    /// Exact bounded lookup used by App-only lazy Window detail reads.
+    /// The caller still owns principal and Project visibility authorization.
+    pub fn get_window_activity_event_by_trace(
+        &self,
+        window_key: &str,
+        principal: Option<(&str, &str)>,
+        server_trace_id: &str,
+    ) -> anyhow::Result<Option<WindowActivityEventRecord>> {
+        let conn = self.lock_connection(crate::StoreDomain::WindowActivity);
+        let select = "SELECT e.event_id, e.client_window_key, e.client_window_source,
+                    e.server_trace_id, e.window_started_at_ms, e.window_ended_at_ms,
+                    e.duration_ms, e.action_name, e.operation, e.project, e.status,
+                    e.window_meaningful, e.recorder_gap_session_id,
+                    e.principal_correlation_kind, e.principal_correlation_id,
+                    e.request_observed_at_ms, e.response_handed_at_ms,
+                    e.window_transition_kind, e.response_streaming,
+                    e.window_continuity_eligible, e.http_status, e.ids_json,
+                    CASE WHEN e.principal_kind='oauth2' AND e.principal_correlation_kind='oauth2'
+                        THEN e.principal_user_id END AS oauth_user,
+                    CASE WHEN e.principal_kind='oauth2' AND e.principal_correlation_kind='oauth2'
+                        THEN e.oauth_client_id END AS oauth_client,
+                    CASE WHEN json_valid(e.summary_json) THEN
+                      CASE json_extract(e.summary_json, '$.failure_expectation_result')
+                        WHEN 'matched_expected_failure' THEN 'matched_expected_failure'
+                        WHEN 'matched_expected_result' THEN 'matched_expected_result'
+                        WHEN 'unexpected_failure' THEN 'unexpected_failure'
+                        WHEN 'expectation_mismatch' THEN 'expectation_mismatch'
+                        WHEN 'unexpected_success' THEN 'unexpected_success'
+                      END
+                    END
+             FROM action_events e";
+        let mut records = match principal {
+            Some((kind, id)) => {
+                let sql = format!(
+                    "{select}
+                     WHERE e.client_window_key = ?1
+                       AND e.server_trace_id = ?2
+                       AND e.window_started_at_ms IS NOT NULL
+                       AND e.window_ended_at_ms IS NOT NULL
+                       AND e.principal_correlation_kind = ?3
+                       AND e.principal_correlation_id = ?4
+                     ORDER BY e.event_id DESC
+                     LIMIT 1"
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                collect_window_events(
+                    &conn,
+                    &mut stmt,
+                    params![window_key, server_trace_id, kind, id],
+                    None,
+                )?
+            }
+            None => {
+                let sql = format!(
+                    "{select}
+                     WHERE e.client_window_key = ?1
+                       AND e.server_trace_id = ?2
+                       AND e.window_started_at_ms IS NOT NULL
+                       AND e.window_ended_at_ms IS NOT NULL
+                     ORDER BY e.event_id DESC
+                     LIMIT 1"
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                collect_window_events(&conn, &mut stmt, params![window_key, server_trace_id], None)?
+            }
+        };
+        Ok(records.pop())
+    }
+    /// Goal liveness needs the latest meaningful work even after thousands of
+    /// transport-only App polls. Reuse the action ledger, with a bounded page of
+    /// meaningful events plus the newest observation; never maintain another clock.
+    pub fn list_goal_window_activity_events(
+        &self,
+        window_key: &str,
+        principal: Option<(&str, &str)>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<WindowActivityEventRecord>> {
+        #[cfg(any(test, feature = "root-test-support"))]
+        self.window_history_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut reader = self.lock_history_connection(crate::StoreDomain::WindowActivity)?;
+        let conn = reader.transaction()?;
+        let (kind, id) = principal
+            .map(|(kind, id)| (Some(kind), Some(id)))
+            .unwrap_or((None, None));
+        let mut statement = conn.prepare(
+            "WITH selected AS (
+                SELECT event_id FROM (
+                    SELECT event_id FROM action_events
+                    WHERE client_window_key = ?1 AND window_meaningful = 1
+                      AND window_started_at_ms IS NOT NULL AND window_ended_at_ms IS NOT NULL
+                      AND (?2 IS NULL OR (principal_correlation_kind = ?2 AND principal_correlation_id = ?3))
+                    ORDER BY window_ended_at_ms DESC, event_id DESC LIMIT ?4
+                )
+                UNION
+                SELECT event_id FROM (
+                    SELECT event_id FROM action_events
+                    WHERE client_window_key = ?1
+                      AND window_started_at_ms IS NOT NULL AND window_ended_at_ms IS NOT NULL
+                      AND (?2 IS NULL OR (principal_correlation_kind = ?2 AND principal_correlation_id = ?3))
+                    ORDER BY window_ended_at_ms DESC, event_id DESC LIMIT 1
+                )
+             )
+             SELECT e.event_id, e.client_window_key, e.client_window_source,
+                    e.server_trace_id, e.window_started_at_ms, e.window_ended_at_ms,
+                    e.duration_ms, e.action_name, e.operation, e.project, e.status,
+                    e.window_meaningful, e.recorder_gap_session_id,
+                    e.principal_correlation_kind, e.principal_correlation_id,
+                    e.request_observed_at_ms, e.response_handed_at_ms,
+                    e.window_transition_kind, e.response_streaming, e.window_continuity_eligible, e.http_status,
+                    e.ids_json,
+                    CASE WHEN e.principal_kind='oauth2' AND e.principal_correlation_kind='oauth2'
+                        THEN e.principal_user_id END AS oauth_user,
+                    CASE WHEN e.principal_kind='oauth2' AND e.principal_correlation_kind='oauth2'
+                        THEN e.oauth_client_id END AS oauth_client,
+                    CASE WHEN json_valid(e.summary_json) THEN
+                      CASE json_extract(e.summary_json, '$.failure_expectation_result')
+                        WHEN 'matched_expected_failure' THEN 'matched_expected_failure'
+                        WHEN 'matched_expected_result' THEN 'matched_expected_result'
+                        WHEN 'unexpected_failure' THEN 'unexpected_failure'
+                        WHEN 'expectation_mismatch' THEN 'expectation_mismatch'
+                        WHEN 'unexpected_success' THEN 'unexpected_success'
+                      END
+                    END
+             FROM action_events e JOIN selected s ON s.event_id = e.event_id
+             ORDER BY e.window_ended_at_ms DESC, e.event_id DESC",
+        )?;
+        collect_window_events(
+            &conn,
+            &mut statement,
+            params![
+                window_key,
+                kind,
+                id,
+                bounded_limit(limit, MAX_WINDOW_ACTIVITY_LIMIT)
+            ],
+            None,
+        )
+    }
+
+    /// Variant used only by feature-gated Code Mode Runtime Console dogfood.
+    /// The ordinary Window query extracts only the bounded expectation classification.
+    pub fn list_window_activity_events_with_code_mode_composition(
+        &self,
+        window_key: &str,
+        principal: Option<(&str, &str)>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<WindowActivityEventRecord>> {
+        #[cfg(any(test, feature = "root-test-support"))]
+        self.window_history_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut reader = self.lock_history_connection(crate::StoreDomain::WindowActivity)?;
+        let conn = reader.transaction()?;
+        let (principal_sql, kind, id) = principal_predicate(principal);
+        let sql = format!(
+            "SELECT e.event_id, e.client_window_key, e.client_window_source,
+                    e.server_trace_id, e.window_started_at_ms, e.window_ended_at_ms,
+                    e.duration_ms, e.action_name, e.operation, e.project, e.status,
+                    e.window_meaningful, e.recorder_gap_session_id,
+                    e.principal_correlation_kind, e.principal_correlation_id,
+                    e.request_observed_at_ms, e.response_handed_at_ms,
+                    e.window_transition_kind, e.response_streaming,
+                    e.window_continuity_eligible, e.http_status, e.ids_json,
+                    CASE WHEN e.principal_kind='oauth2' AND e.principal_correlation_kind='oauth2'
+                        THEN e.principal_user_id END AS oauth_user,
+                    CASE WHEN e.principal_kind='oauth2' AND e.principal_correlation_kind='oauth2'
+                        THEN e.oauth_client_id END AS oauth_client,
+                    CASE WHEN json_valid(e.summary_json) THEN
+                      CASE json_extract(e.summary_json, '$.failure_expectation_result')
+                        WHEN 'matched_expected_failure' THEN 'matched_expected_failure'
+                        WHEN 'matched_expected_result' THEN 'matched_expected_result'
+                        WHEN 'unexpected_failure' THEN 'unexpected_failure'
+                        WHEN 'expectation_mismatch' THEN 'expectation_mismatch'
+                        WHEN 'unexpected_success' THEN 'unexpected_success'
+                      END
+                    END, e.summary_json
+             FROM action_events e
+             WHERE e.client_window_key = ?1
+               AND e.window_started_at_ms IS NOT NULL
+               AND e.window_ended_at_ms IS NOT NULL
+               {principal_sql}
+             ORDER BY COALESCE(e.request_observed_at_ms, e.window_started_at_ms) DESC, e.event_id DESC
+             LIMIT ?4"
+        );
+        let limit = bounded_limit(limit, MAX_WINDOW_ACTIVITY_LIMIT);
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = match (kind, id) {
+            (Some(kind), Some(id)) => stmt.query(params![window_key, kind, id, limit])?,
+            _ => {
+                let sql = sql.replace("LIMIT ?4", "LIMIT ?2");
+                drop(stmt);
+                let mut stmt = conn.prepare(&sql)?;
+                let records =
+                    collect_window_events(&conn, &mut stmt, params![window_key, limit], Some(25))?;
+                return Ok(records);
+            }
+        };
+        collect_window_event_rows(&conn, &mut rows, Some(25))
+    }
+
+    /// Latest authoritative Window/Session relation for diagnostic continuity.
+    /// `work_on_project` wins a same-millisecond tie because it is the explicit
+    /// create/resume/switch boundary; this remains a non-authoritative hint.
+    pub fn latest_window_workflow_affinity(
+        &self,
+        window_key: &str,
+        principal_kind: &str,
+        principal_id: &str,
+        project: &str,
+    ) -> anyhow::Result<Option<WindowWorkflowAffinityRecord>> {
+        let conn = self.lock_connection(crate::StoreDomain::WindowActivity);
+        conn.query_row(
+            "SELECT l.workflow_session_id, l.project, l.workflow_session_relation, l.linked_at_ms
+             FROM action_event_workflow_links l
+             JOIN action_events e ON e.event_id = l.event_id
+             WHERE e.client_window_key = ?1
+               AND e.principal_correlation_kind = ?2
+               AND e.principal_correlation_id = ?3
+               AND l.project = ?4
+             ORDER BY l.linked_at_ms DESC,
+                      CASE l.workflow_session_relation WHEN 'work_on_project' THEN 0 ELSE 1 END ASC,
+                      e.event_id DESC
+             LIMIT 1",
+            params![window_key, principal_kind, principal_id, project],
+            |row| {
+                Ok(WindowWorkflowAffinityRecord {
+                    workflow_session_id: row.get(0)?,
+                    project: row.get(1)?,
+                    relation: row.get(2)?,
+                    linked_at_ms: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn list_window_workflow_sessions(
+        &self,
+        window_key: &str,
+        principal: Option<(&str, &str)>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<WindowWorkflowSessionSummaryRecord>> {
+        #[cfg(any(test, feature = "root-test-support"))]
+        self.window_history_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let conn = self.lock_history_connection(crate::StoreDomain::WindowActivity)?;
+        let (principal_sql, kind, id) = principal_predicate(principal);
+        let sql = format!(
+            "SELECT l.workflow_session_id, MAX(l.project), MIN(l.linked_at_ms),
+                    MAX(l.linked_at_ms), COUNT(*),
+                    GROUP_CONCAT(DISTINCT l.workflow_session_relation)
+             FROM action_event_workflow_links l
+             JOIN action_events e ON e.event_id = l.event_id
+             WHERE e.client_window_key = ?1 {principal_sql}
+             GROUP BY l.workflow_session_id
+             ORDER BY MAX(l.linked_at_ms) DESC, l.workflow_session_id ASC
+             LIMIT ?4"
+        );
+        let limit = bounded_limit(limit, MAX_WINDOW_LINK_LIMIT);
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = match (kind, id) {
+            (Some(kind), Some(id)) => stmt.query(params![window_key, kind, id, limit])?,
+            _ => {
+                let sql = sql.replace("LIMIT ?4", "LIMIT ?2");
+                drop(stmt);
+                let mut stmt = conn.prepare(&sql)?;
+                let mut rows = stmt.query(params![window_key, limit])?;
+                return collect_window_session_rows(&mut rows);
+            }
+        };
+        collect_window_session_rows(&mut rows)
+    }
+
+    pub fn list_session_linked_windows(
+        &self,
+        workflow_session_id: &str,
+        principal: Option<(&str, &str)>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<WindowSessionLinkSummaryRecord>> {
+        let conn = self.lock_history_connection(crate::StoreDomain::WindowActivity)?;
+        let limit = bounded_limit(limit, MAX_WINDOW_LINK_LIMIT);
+        match principal {
+            Some((kind, id)) => {
+                let mut stmt = conn.prepare(
+                    "WITH linked AS (
+                        SELECT e.client_window_key AS window_key,
+                               MAX(e.client_window_source) AS source,
+                               MIN(l.linked_at_ms) AS first_linked,
+                               MAX(l.linked_at_ms) AS last_linked,
+                               COUNT(*) AS relation_count,
+                               GROUP_CONCAT(DISTINCT l.workflow_session_relation) AS relations
+                        FROM action_event_workflow_links l
+                        JOIN action_events e ON e.event_id = l.event_id
+                        WHERE l.workflow_session_id = ?1
+                          AND e.client_window_key IS NOT NULL
+                          AND e.principal_correlation_kind = ?2
+                          AND e.principal_correlation_id = ?3
+                        GROUP BY e.client_window_key
+                    )
+                    SELECT linked.window_key, linked.source, linked.first_linked,
+                           linked.last_linked, linked.relation_count, linked.relations,
+                           (SELECT MAX(a.window_ended_at_ms)
+                            FROM action_events a
+                            WHERE a.client_window_key = linked.window_key
+                              AND a.principal_correlation_kind = ?2
+                              AND a.principal_correlation_id = ?3),
+                           (SELECT MAX(CASE WHEN a.window_meaningful = 1 THEN a.window_ended_at_ms END)
+                            FROM action_events a
+                            WHERE a.client_window_key = linked.window_key
+                              AND a.principal_correlation_kind = ?2
+                              AND a.principal_correlation_id = ?3),
+                           (SELECT COUNT(*)
+                            FROM action_events gap
+                            WHERE gap.client_window_key = linked.window_key
+                              AND gap.recorder_gap_session_id = ?1
+                              AND gap.principal_correlation_kind = ?2
+                              AND gap.principal_correlation_id = ?3)
+                    FROM linked
+                    ORDER BY linked.last_linked DESC, linked.window_key ASC
+                    LIMIT ?4",
+                )?;
+                let mut rows = stmt.query(params![workflow_session_id, kind, id, limit])?;
+                collect_session_window_rows(&mut rows)
+            }
+            None => {
+                let mut stmt = conn.prepare(
+                    "WITH linked AS (
+                        SELECT e.client_window_key AS window_key,
+                               MAX(e.client_window_source) AS source,
+                               MIN(l.linked_at_ms) AS first_linked,
+                               MAX(l.linked_at_ms) AS last_linked,
+                               COUNT(*) AS relation_count,
+                               GROUP_CONCAT(DISTINCT l.workflow_session_relation) AS relations
+                        FROM action_event_workflow_links l
+                        JOIN action_events e ON e.event_id = l.event_id
+                        WHERE l.workflow_session_id = ?1
+                          AND e.client_window_key IS NOT NULL
+                        GROUP BY e.client_window_key
+                    )
+                    SELECT linked.window_key, linked.source, linked.first_linked,
+                           linked.last_linked, linked.relation_count, linked.relations,
+                           (SELECT MAX(a.window_ended_at_ms)
+                            FROM action_events a
+                            WHERE a.client_window_key = linked.window_key),
+                           (SELECT MAX(CASE WHEN a.window_meaningful = 1 THEN a.window_ended_at_ms END)
+                            FROM action_events a
+                            WHERE a.client_window_key = linked.window_key),
+                           (SELECT COUNT(*)
+                            FROM action_events gap
+                            WHERE gap.client_window_key = linked.window_key
+                              AND gap.recorder_gap_session_id = ?1)
+                    FROM linked
+                    ORDER BY linked.last_linked DESC, linked.window_key ASC
+                    LIMIT ?2",
+                )?;
+                let mut rows = stmt.query(params![workflow_session_id, limit])?;
+                collect_session_window_rows(&mut rows)
+            }
+        }
+    }
+}
+
+use rusqlite::OptionalExtension;
+
+fn window_summary_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<WindowActivitySummaryRecord> {
+    Ok(WindowActivitySummaryRecord {
+        client_window_key: row.get(0)?,
+        client_window_source: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+        first_seen_at_ms: row.get(2)?,
+        last_seen_at_ms: row.get(3)?,
+        last_tool_call_at_ms: row.get(4)?,
+        last_meaningful_activity_at_ms: row.get(5)?,
+        linked_session_count: usize::try_from(row.get::<_, i64>(6)?).unwrap_or(usize::MAX),
+        recorder_gap_count: usize::try_from(row.get::<_, i64>(7)?).unwrap_or(usize::MAX),
+    })
+}
+
+fn collect_window_events<P: rusqlite::Params>(
+    conn: &Connection,
+    stmt: &mut rusqlite::Statement<'_>,
+    params: P,
+    code_mode_summary_column: Option<usize>,
+) -> anyhow::Result<Vec<WindowActivityEventRecord>> {
+    let mut rows = stmt.query(params)?;
+    collect_window_event_rows(conn, &mut rows, code_mode_summary_column)
+}
+
+fn safe_workflow_session_id(value: &str) -> bool {
+    let Some(suffix) = value.strip_prefix("wc_sess_") else {
+        return false;
+    };
+    (suffix.len() == 16
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')))
+        || (suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+fn window_correlation_from_ids_json(
+    ids_json: Option<String>,
+) -> (Option<String>, Vec<String>, Option<String>) {
+    let Some(value) = ids_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+    else {
+        return (None, Vec::new(), None);
+    };
+    let async_job_id = value
+        .get("async_job_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|job_id| is_safe_job_id(job_id))
+        .map(str::to_string);
+    let mut observed_job_ids = Vec::new();
+    if let Some(items) = value
+        .get("observed_job_ids")
+        .and_then(serde_json::Value::as_array)
+    {
+        for item in items.iter().take(8) {
+            let Some(job_id) = item
+                .as_str()
+                .map(str::trim)
+                .filter(|job_id| is_safe_job_id(job_id))
+            else {
+                continue;
+            };
+            if !observed_job_ids.iter().any(|existing| existing == job_id) {
+                observed_job_ids.push(job_id.to_string());
+            }
+        }
+    }
+    let business_session_id = value
+        .get("business_session_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|session_id| safe_workflow_session_id(session_id))
+        .map(str::to_string);
+    (async_job_id, observed_job_ids, business_session_id)
+}
+
+fn collect_window_event_rows(
+    conn: &Connection,
+    rows: &mut rusqlite::Rows<'_>,
+    code_mode_summary_column: Option<usize>,
+) -> anyhow::Result<Vec<WindowActivityEventRecord>> {
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        let event_id: String = row.get(0)?;
+        let (async_job_id, observed_job_ids, business_session_id) =
+            window_correlation_from_ids_json(row.get(21)?);
+        out.push(WindowActivityEventRecord {
+            event_id: event_id.clone(),
+            client_window_key: row.get(1)?,
+            client_window_source: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            server_trace_id: row.get(3)?,
+            started_at_ms: row.get(4)?,
+            ended_at_ms: row.get(5)?,
+            duration_ms: row.get(6)?,
+            action_name: row.get(7)?,
+            operation: row.get(8)?,
+            project: row.get(9)?,
+            status: row.get(10)?,
+            failure_expectation_result: row.get(24)?,
+            meaningful: row.get(11)?,
+            async_job_id,
+            observed_job_ids,
+            business_session_id,
+            recorder_gap_session_id: row.get(12)?,
+            workflow_links: Vec::new(),
+            principal_correlation_kind: row.get(13)?,
+            principal_correlation_id: row.get(14)?,
+            managed_oauth_identity: row
+                .get::<_, Option<String>>("oauth_user")?
+                .filter(|value| !value.trim().is_empty())
+                .zip(
+                    row.get::<_, Option<String>>("oauth_client")?
+                        .filter(|value| !value.trim().is_empty()),
+                ),
+            request_observed_at_ms: row.get(15)?,
+            response_handed_at_ms: row.get(16)?,
+            window_transition_kind: row.get(17)?,
+            response_streaming: row.get(18)?,
+            window_continuity_eligible: row.get(19)?,
+            http_status: row.get(20)?,
+            code_mode_composition: match code_mode_summary_column {
+                Some(column) => row
+                    .get::<_, Option<String>>(column)?
+                    .and_then(|summary_json| {
+                        serde_json::from_str::<serde_json::Value>(&summary_json).ok()
+                    })
+                    .and_then(|summary| summary.get("code_mode_composition").cloned()),
+                None => None,
+            },
+        });
+    }
+    // Fetch links for the exact bounded page in one query. Historical callers
+    // hold an explicit read transaction: a reader mutex alone cannot preserve
+    // this page across concurrent Audit writes. Per-event queries made each refresh perform
+    // thousands of statement preparations before it could return any rows.
+    if !out.is_empty() {
+        let ids = out
+            .iter()
+            .map(|event| event.event_id.as_str())
+            .collect::<Vec<_>>();
+        let encoded_ids = serde_json::to_string(&ids)?;
+        let positions = ids
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| (id.to_string(), index))
+            .collect::<HashMap<_, _>>();
+        let mut stmt = conn.prepare_cached(
+            "SELECT event_id, workflow_session_id, project, workflow_session_relation, linked_at_ms
+             FROM action_event_workflow_links
+             WHERE event_id IN (SELECT value FROM json_each(?1))
+             ORDER BY event_id ASC, linked_at_ms ASC, workflow_session_relation ASC, workflow_session_id ASC",
+        )?;
+        let mut links = stmt.query(params![encoded_ids])?;
+        while let Some(row) = links.next()? {
+            let event_id: String = row.get(0)?;
+            if let Some(&index) = positions.get(&event_id) {
+                out[index].workflow_links.push(WindowWorkflowLinkRecord {
+                    workflow_session_id: row.get(1)?,
+                    project: row.get(2)?,
+                    relation: row.get(3)?,
+                    linked_at_ms: row.get(4)?,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn relation_set(csv: Option<String>) -> Vec<String> {
+    csv.unwrap_or_default()
+        .split(',')
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn collect_window_session_rows(
+    rows: &mut rusqlite::Rows<'_>,
+) -> anyhow::Result<Vec<WindowWorkflowSessionSummaryRecord>> {
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(WindowWorkflowSessionSummaryRecord {
+            workflow_session_id: row.get(0)?,
+            project: row.get(1)?,
+            first_linked_at_ms: row.get(2)?,
+            last_linked_at_ms: row.get(3)?,
+            relation_count: usize::try_from(row.get::<_, i64>(4)?).unwrap_or(usize::MAX),
+            relations: relation_set(row.get(5)?),
+        });
+    }
+    Ok(out)
+}
+
+fn collect_session_window_rows(
+    rows: &mut rusqlite::Rows<'_>,
+) -> anyhow::Result<Vec<WindowSessionLinkSummaryRecord>> {
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(WindowSessionLinkSummaryRecord {
+            client_window_key: row.get(0)?,
+            client_window_source: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            first_linked_at_ms: row.get(2)?,
+            last_linked_at_ms: row.get(3)?,
+            relation_count: usize::try_from(row.get::<_, i64>(4)?).unwrap_or(usize::MAX),
+            relations: relation_set(row.get(5)?),
+            last_seen_at_ms: row.get(6)?,
+            last_meaningful_activity_at_ms: row.get(7)?,
+            recorder_gap_count: usize::try_from(row.get::<_, i64>(8)?).unwrap_or(usize::MAX),
+        });
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    mod inventory;
+    mod peer_query;
+    mod queries;
+    mod read_lane;
+
+    use super::*;
+    use crate::models::{ActionEventRecord, ActionEventWorkflowLinkRecord, ActionSessionRecord};
+
+    fn event(id: &str, window: &str, principal: &str, project: &str, at: i64) -> ActionEventRecord {
+        ActionEventRecord {
+            event_id: id.to_string(),
+            session_id: "audit-session".to_string(),
+            started_at: at / 1000,
+            ended_at: at / 1000,
+            duration_ms: 1,
+            endpoint: "/mcp".to_string(),
+            operation: Some("read_files".to_string()),
+            action_name: "toolsCall".to_string(),
+            project: Some(project.to_string()),
+            principal_kind: None,
+            principal_user_id: None,
+            oauth_client_id: None,
+            status: "success".to_string(),
+            http_status: Some(200),
+            error_summary: None,
+            warning_summary: None,
+            changed_files_json: "[]".to_string(),
+            ids_json: "{}".to_string(),
+            summary_json: "{}".to_string(),
+            request_bytes: None,
+            response_bytes: None,
+            client_window_key: Some(window.to_string()),
+            client_window_source: Some("openai-session".to_string()),
+            server_trace_id: Some(format!("trace-{id}")),
+            principal_correlation_kind: Some("username".to_string()),
+            principal_correlation_id: Some(principal.to_string()),
+            window_started_at_ms: Some(at),
+            window_ended_at_ms: Some(at + 1),
+            request_observed_at_ms: None,
+            response_handed_at_ms: None,
+            window_transition_kind: None,
+            response_streaming: None,
+            window_continuity_eligible: None,
+            window_meaningful: true,
+            recorder_gap_session_id: None,
+        }
+    }
+
+    fn seed_session(db: &Database) {
+        db.insert_action_session(&ActionSessionRecord {
+            session_id: "audit-session".to_string(),
+            title: None,
+            note: None,
+            status: "open".to_string(),
+            created_at: 1,
+            updated_at: 1,
+            closed_at: None,
+            first_event_at: None,
+            last_event_at: None,
+            total_actions: 0,
+            success_count: 0,
+            failed_count: 0,
+            timeout_or_unknown_count: 0,
+            warning_count: 0,
+            total_duration_ms: 0,
+            changed_files_count: 0,
+            job_ids_count: 0,
+        })
+        .unwrap();
+    }
+
+    fn append(db: &Database, event: ActionEventRecord, links: &[(&str, &str)]) {
+        let records = links
+            .iter()
+            .map(|(session, relation)| ActionEventWorkflowLinkRecord {
+                event_id: event.event_id.clone(),
+                workflow_session_id: (*session).to_string(),
+                workflow_session_relation: (*relation).to_string(),
+                project: event.project.clone(),
+                linked_at_ms: event.window_ended_at_ms.unwrap(),
+            })
+            .collect::<Vec<_>>();
+        db.append_action_event_and_update_session(&event, &records, 1, 0, 0, 0, 1, 0, 0)
+            .unwrap();
+    }
+
+    #[test]
+    fn window_activity_projects_safe_job_identity_from_audit_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(&tmp.path().join("window-jobs.db")).unwrap();
+        seed_session(&db);
+        let mut item = event("job-a", "wj", "alice", "agent:r:p", 1_000);
+        item.ids_json = serde_json::json!({
+            "async_job_id": "wc_job_background_123",
+            "observed_job_ids": [
+                "wc_job_observed_456",
+                "../unsafe",
+                "wc_job_observed_456"
+            ],
+            "business_session_id": "wc_sess_6666666666666666",
+            "observation_token": "must-not-project"
+        })
+        .to_string();
+        append(&db, item, &[]);
+
+        let rows = db
+            .list_window_activity_events("wj", Some(("username", "alice")), 20)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].async_job_id.as_deref(),
+            Some("wc_job_background_123")
+        );
+        assert_eq!(
+            rows[0].observed_job_ids,
+            vec!["wc_job_observed_456".to_string()]
+        );
+        assert_eq!(
+            rows[0].business_session_id.as_deref(),
+            Some("wc_sess_6666666666666666")
+        );
+        let projected = serde_json::to_value(&rows[0]).unwrap();
+        assert!(projected.get("business_session_id").is_none());
+    }
+
+    #[test]
+    fn window_activity_expectation_projection_is_bounded_and_legacy_safe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(&tmp.path().join("expectations.db")).unwrap();
+        seed_session(&db);
+        for (index, (summary, expected)) in [
+            (
+                r#"{"failure_expectation_result":"matched_expected_failure"}"#,
+                Some("matched_expected_failure"),
+            ),
+            (
+                r#"{"failure_expectation_result":"unexpected_success"}"#,
+                Some("unexpected_success"),
+            ),
+            (r#"{"failure_expectation_result":"secret free text"}"#, None),
+            ("{}", None),
+            ("malformed", None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let window = format!("expectation-{index}");
+            let mut item = event(&window, &window, "alice", "agent:r:p", 1000);
+            item.summary_json = summary.to_string();
+            append(&db, item, &[]);
+            let rows = db
+                .list_window_activity_events(&window, Some(("username", "alice")), 10)
+                .unwrap();
+            assert_eq!(rows[0].failure_expectation_result.as_deref(), expected);
+            assert_eq!(rows[0].status, "success");
+            let rows = db
+                .list_window_activity_events_with_code_mode_composition(&window, None, 10)
+                .unwrap();
+            assert_eq!(rows[0].failure_expectation_result.as_deref(), expected);
+        }
+    }
+
+    #[test]
+    fn window_summary_tracks_first_seen_at() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(&tmp.path().join("window-first-seen.db")).unwrap();
+        seed_session(&db);
+        append(&db, event("first", "wf", "alice", "agent:r:p", 1_000), &[]);
+        append(&db, event("later", "wf", "alice", "agent:r:p", 5_000), &[]);
+
+        let summary = db
+            .get_window_activity_summary("wf", Some(("username", "alice")))
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.first_seen_at_ms, 1_001);
+        assert_eq!(summary.last_seen_at_ms, 5_001);
+
+        let list = db
+            .list_window_activity_summaries(Some(("username", "alice")), 20)
+            .unwrap();
+        assert_eq!(list[0].first_seen_at_ms, 1_001);
+    }
+
+    #[test]
+    fn window_session_queries_are_many_to_many_and_principal_bounded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(&tmp.path().join("window-activity.db")).unwrap();
+        seed_session(&db);
+        append(
+            &db,
+            event("a1", "w1", "alice", "agent:r:p", 1_000),
+            &[("s1", "recording")],
+        );
+        append(
+            &db,
+            event("a2", "w1", "alice", "agent:r:p", 2_000),
+            &[("s2", "work_on_project")],
+        );
+        append(
+            &db,
+            event("a3", "w2", "alice", "agent:r:p", 3_000),
+            &[("s2", "recording")],
+        );
+        let mut gap = event("a-gap", "w1", "alice", "agent:r:p", 3_500);
+        gap.recorder_gap_session_id = Some("s2".to_string());
+        append(&db, gap, &[]);
+        append(
+            &db,
+            event("b1", "wb", "bob", "agent:b:p", 4_000),
+            &[("sb", "recording")],
+        );
+
+        let w1 = db
+            .list_window_workflow_sessions("w1", Some(("username", "alice")), 20)
+            .unwrap();
+        assert_eq!(w1.len(), 2);
+        assert!(w1.iter().any(|link| link.workflow_session_id == "s1"));
+        assert!(w1.iter().any(|link| link.workflow_session_id == "s2"));
+        let s2 = db
+            .list_session_linked_windows("s2", Some(("username", "alice")), 20)
+            .unwrap();
+        assert_eq!(s2.len(), 2);
+        assert_eq!(
+            s2.iter()
+                .find(|link| link.client_window_key == "w1")
+                .map(|link| link.recorder_gap_count),
+            Some(1),
+            "unrecorded Window activity must remain separate from the Session link event yet still surface as a recorder gap"
+        );
+        assert!(db
+            .list_window_activity_events("wb", Some(("username", "alice")), 20)
+            .unwrap()
+            .is_empty());
+        let affinity = db
+            .latest_window_workflow_affinity("w1", "username", "alice", "agent:r:p")
+            .unwrap()
+            .unwrap();
+        assert_eq!(affinity.workflow_session_id, "s2");
+        assert_eq!(affinity.relation, "work_on_project");
+    }
+}

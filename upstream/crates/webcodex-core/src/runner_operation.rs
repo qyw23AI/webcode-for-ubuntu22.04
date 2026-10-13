@@ -1,0 +1,3660 @@
+//! Canonical semantic Runner operations and the V2 request wire adapter.
+//!
+//! `RunnerRequest` intentionally remains the compatibility DTO used by all V2
+//! transports. Production semantics should use `RunnerOperation`: the V2
+//! `kind + optional payload bag` is decoded and validated once at the boundary,
+//! then operation identity and its required payload travel together.
+
+use crate::coding_agent::{validate_request as validate_coding_agent_request, CodingAgentRequest};
+use crate::lsp_bridge::RunnerLspPayload;
+use crate::mcp_gateway::{validate_request as validate_mcp_gateway_request, McpGatewayRequest};
+use crate::plugin::{validate_request as validate_plugin_gateway_request, PluginGatewayRequest};
+use crate::runner_instruction::{
+    RunnerInstructionRequest, RUNNER_INSTRUCTION_REQUEST_KIND, RUNNER_INSTRUCTION_REQUEST_MAX_BYTES,
+};
+use crate::runner_protocol::{
+    shell_computer_request_payload_max_bytes, validate_process_argv,
+    validate_raw_shell_wire_command, validate_script_request, PersistentShellRequest,
+    RunnerConfigOperationRequest, RunnerRequest, ShellFileOpRequest, ShellJobContext,
+    ShellJobStructuredExecutionMetadata, ShellJobValidationStep, ShellProcessArgv,
+    ShellScriptLanguage, ShellScriptPayload, PROCESS_CWD_MAX_BYTES, PROCESS_STDIN_MAX_BYTES,
+    PROCESS_TIMEOUT_MAX_SECS, RUNNER_CONFIG_REQUEST_KIND, RUNNER_CONFIG_REQUEST_MAX_BYTES,
+    STRUCTURED_EXECUTION_DIRECT_SYNC_TIMEOUT_MAX_SECS, STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS,
+    STRUCTURED_EXECUTION_TIMEOUT_MIN_SECS,
+};
+use crate::runner_skill::{
+    RunnerSkillExecutionRequest, RunnerSkillRequest, RUNNER_SKILL_EXECUTION_REQUEST_KIND,
+    RUNNER_SKILL_EXECUTION_REQUEST_MAX_BYTES, RUNNER_SKILL_REQUEST_KIND,
+    RUNNER_SKILL_REQUEST_MAX_BYTES,
+};
+use crate::ssh_resource::{SshResourceRequest, SSH_RESOURCE_REQUEST_MAX_BYTES};
+use crate::validation_bridge::{validate_bridge_request, ValidationBridgeRequest};
+
+/// Request/envelope metadata that is independent of operation semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerInvocationMetadata {
+    pub request_id: String,
+    pub client_id: String,
+    pub requested_by: String,
+    pub created_at: i64,
+}
+
+/// Canonical internal Runner invocation.
+#[derive(Debug, Clone)]
+pub struct RunnerInvocation {
+    pub metadata: RunnerInvocationMetadata,
+    pub operation: RunnerOperation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerShellOperation {
+    pub cwd: Option<String>,
+    pub command: String,
+    pub shell: Option<crate::workflow_session_contract::ExecutionShell>,
+    pub login: bool,
+    pub stdin: Option<String>,
+    /// Historical V2 `run_shell.max_bytes`, consumed by the external-search
+    /// provider route as a per-request output cap. Native raw shell ignores it.
+    pub max_bytes: Option<usize>,
+    pub timeout_secs: u64,
+    /// Present only for Session-bound SSH raw-shell execution.
+    pub job_context: Option<ShellJobContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerProcessOperation {
+    pub cwd: Option<String>,
+    pub process: ShellProcessArgv,
+    pub stdin: Option<String>,
+    pub timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerScriptOperation {
+    pub cwd: Option<String>,
+    pub script: ShellScriptPayload,
+    pub stdin: Option<String>,
+    pub timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerSkillResourceOperation {
+    pub cwd: Option<String>,
+    pub request: RunnerSkillExecutionRequest,
+    pub timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerJobShellOperation {
+    pub job_id: String,
+    pub cwd: Option<String>,
+    pub command: String,
+    pub shell: Option<crate::workflow_session_contract::ExecutionShell>,
+    pub login: bool,
+    pub timeout_secs: u64,
+    pub context: ShellJobContext,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerJobValidationOperation {
+    pub job_id: String,
+    pub cwd: Option<String>,
+    pub steps: Vec<ShellJobValidationStep>,
+    pub timeout_secs: u64,
+    pub context: ShellJobContext,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerJobFormatOperation {
+    pub job_id: String,
+    pub cwd: Option<String>,
+    pub plan: crate::project_format::ProjectFormatPlan,
+    pub timeout_secs: u64,
+    pub context: ShellJobContext,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerJobBuildOperation {
+    pub job_id: String,
+    pub cwd: Option<String>,
+    pub process: ShellProcessArgv,
+    pub provenance: crate::project_build::ProjectBuildProvenance,
+    pub timeout_secs: u64,
+    pub context: ShellJobContext,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerJobProcessOperation {
+    pub job_id: String,
+    pub cwd: Option<String>,
+    pub process: ShellProcessArgv,
+    pub stdin: Option<String>,
+    pub timeout_secs: u64,
+    pub context: ShellJobContext,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerJobScriptOperation {
+    pub job_id: String,
+    pub cwd: Option<String>,
+    pub script: ShellScriptPayload,
+    pub stdin: Option<String>,
+    pub timeout_secs: u64,
+    pub context: ShellJobContext,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerJobSkillResourceOperation {
+    pub job_id: String,
+    pub cwd: Option<String>,
+    pub request: RunnerSkillExecutionRequest,
+    pub timeout_secs: u64,
+    pub context: ShellJobContext,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunnerJobOperation {
+    StartShell(RunnerJobShellOperation),
+    StartValidation(RunnerJobValidationOperation),
+    StartBuild(RunnerJobBuildOperation),
+    StartFormat(RunnerJobFormatOperation),
+    StartProcess(RunnerJobProcessOperation),
+    StartInteractiveProcess(RunnerJobProcessOperation),
+    StartDetachedProcess(RunnerJobProcessOperation),
+    StartScript(RunnerJobScriptOperation),
+    StartSkillResource(RunnerJobSkillResourceOperation),
+    Stop { job_id: String },
+}
+
+impl RunnerJobOperation {
+    pub fn job_id(&self) -> &str {
+        match self {
+            Self::StartShell(operation) => &operation.job_id,
+            Self::StartValidation(operation) => &operation.job_id,
+            Self::StartBuild(operation) => &operation.job_id,
+            Self::StartFormat(operation) => &operation.job_id,
+            Self::StartProcess(operation)
+            | Self::StartInteractiveProcess(operation)
+            | Self::StartDetachedProcess(operation) => &operation.job_id,
+            Self::StartScript(operation) => &operation.job_id,
+            Self::StartSkillResource(operation) => &operation.job_id,
+            Self::Stop { job_id } => job_id,
+        }
+    }
+
+    pub fn context(&self) -> Option<&ShellJobContext> {
+        match self {
+            Self::StartShell(operation) => Some(&operation.context),
+            Self::StartValidation(operation) => Some(&operation.context),
+            Self::StartBuild(operation) => Some(&operation.context),
+            Self::StartFormat(operation) => Some(&operation.context),
+            Self::StartProcess(operation)
+            | Self::StartInteractiveProcess(operation)
+            | Self::StartDetachedProcess(operation) => Some(&operation.context),
+            Self::StartScript(operation) => Some(&operation.context),
+            Self::StartSkillResource(operation) => Some(&operation.context),
+            Self::Stop { .. } => None,
+        }
+    }
+
+    pub fn cwd(&self) -> Option<&str> {
+        match self {
+            Self::StartShell(operation) => operation.cwd.as_deref(),
+            Self::StartValidation(operation) => operation.cwd.as_deref(),
+            Self::StartBuild(operation) => operation.cwd.as_deref(),
+            Self::StartFormat(operation) => operation.cwd.as_deref(),
+            Self::StartProcess(operation)
+            | Self::StartInteractiveProcess(operation)
+            | Self::StartDetachedProcess(operation) => operation.cwd.as_deref(),
+            Self::StartScript(operation) => operation.cwd.as_deref(),
+            Self::StartSkillResource(operation) => operation.cwd.as_deref(),
+            Self::Stop { .. } => None,
+        }
+    }
+
+    pub fn is_detached_process(&self) -> bool {
+        matches!(self, Self::StartDetachedProcess(_))
+    }
+
+    pub fn is_start(&self) -> bool {
+        !matches!(self, Self::Stop { .. })
+    }
+
+    /// Derive the execution metadata that must be persisted in Job recovery
+    /// context. Correlation-only validation identity/tool/assertion fields are
+    /// copied from the admitted context; they never grant execution authority.
+    pub fn expected_structured_execution(&self) -> Option<ShellJobStructuredExecutionMetadata> {
+        let correlation = self
+            .context()
+            .and_then(|context| context.structured_execution.as_ref())
+            .map(|metadata| {
+                (
+                    metadata.validation_identity.clone(),
+                    metadata.validation_tool.clone(),
+                    metadata.assertion_name.clone(),
+                )
+            })
+            .unwrap_or((None, None, None));
+        match self {
+            Self::StartFormat(_) => Some(crate::project_format::structured_metadata()),
+            Self::StartBuild(operation) => Some(ShellJobStructuredExecutionMetadata {
+                execution_source: "project_build".to_string(),
+                language: None,
+                script_bytes: None,
+                arg_count: operation.process.args.len(),
+                stdin_present: false,
+                validation_identity: None,
+                validation_tool: None,
+                assertion_name: None,
+            }),
+            Self::StartProcess(operation) | Self::StartInteractiveProcess(operation) => {
+                Some(ShellJobStructuredExecutionMetadata {
+                    execution_source: if matches!(self, Self::StartInteractiveProcess(_)) {
+                        "run_process_interactive"
+                    } else {
+                        "run_process"
+                    }
+                    .to_string(),
+                    language: None,
+                    script_bytes: None,
+                    arg_count: operation.process.args.len(),
+                    stdin_present: operation.stdin.is_some(),
+                    validation_identity: correlation.0,
+                    validation_tool: correlation.1,
+                    assertion_name: correlation.2,
+                })
+            }
+            Self::StartDetachedProcess(operation) => Some(ShellJobStructuredExecutionMetadata {
+                execution_source: "run_detached_process".to_string(),
+                language: None,
+                script_bytes: None,
+                arg_count: operation.process.args.len(),
+                stdin_present: operation.stdin.is_some(),
+                validation_identity: correlation.0,
+                validation_tool: correlation.1,
+                assertion_name: None,
+            }),
+            Self::StartScript(operation) => Some(ShellJobStructuredExecutionMetadata {
+                execution_source: "run_script".to_string(),
+                language: Some(operation.script.language),
+                script_bytes: Some(operation.script.script.len()),
+                arg_count: operation.script.args.len(),
+                stdin_present: operation.stdin.is_some(),
+                validation_identity: correlation.0,
+                validation_tool: correlation.1,
+                assertion_name: correlation.2,
+            }),
+            Self::StartSkillResource(operation) => Some(ShellJobStructuredExecutionMetadata {
+                execution_source: "run_skill_resource".to_string(),
+                language: None,
+                script_bytes: None,
+                arg_count: operation.request.args.len(),
+                stdin_present: true,
+                validation_identity: correlation.0,
+                validation_tool: correlation.1,
+                assertion_name: correlation.2,
+            }),
+            Self::StartShell(_) | Self::StartValidation(_) | Self::Stop { .. } => None,
+        }
+    }
+}
+
+/// Legacy V2 file-operation fields, now scoped under a closed file operation
+/// instead of sharing the top-level Runner request payload bag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerFilePayload {
+    pub cwd: Option<String>,
+    pub path: String,
+    pub content: Option<String>,
+    pub max_bytes: Option<usize>,
+    pub expected_sha256: Option<String>,
+    pub expected_prefix: Option<String>,
+    pub start_line: Option<usize>,
+    pub end_line: Option<usize>,
+    pub create_dirs: bool,
+}
+
+macro_rules! runner_file_operations {
+    ($(($variant:ident, $wire:literal, $server:literal)),+ $(,)?) => {
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub enum RunnerFileOperation {
+            $($variant(RunnerFilePayload)),+
+        }
+
+        impl RunnerFileOperation {
+            pub fn is_wire_kind(kind: &str) -> bool {
+                matches!(kind, $($wire)|+)
+            }
+
+            pub fn wire_kind(&self) -> &'static str {
+                match self { $(Self::$variant(_) => $wire),+ }
+            }
+
+            pub fn server_op(&self) -> &'static str {
+                match self { $(Self::$variant(_) => $server),+ }
+            }
+
+            pub fn payload(&self) -> &RunnerFilePayload {
+                match self { $(Self::$variant(payload) => payload),+ }
+            }
+
+            fn from_wire_kind(kind: &str, payload: RunnerFilePayload) -> Result<Self, String> {
+                validate_file_payload(kind, &payload)?;
+                match kind {
+                    $($wire => Ok(Self::$variant(payload))),+,
+                    _ => Err(format!("unknown Runner V2 request kind: {kind}")),
+                }
+            }
+
+            pub fn from_server_request(body: &ShellFileOpRequest) -> Result<Self, String> {
+                let payload = RunnerFilePayload {
+                    cwd: body.cwd.clone().map(|cwd| cwd.trim().to_string()),
+                    path: body.path.trim().to_string(),
+                    content: body.content.clone(),
+                    max_bytes: body.max_bytes,
+                    expected_sha256: body.expected_sha256.clone(),
+                    expected_prefix: body.expected_prefix.clone(),
+                    start_line: body.start_line,
+                    end_line: body.end_line,
+                    create_dirs: body.create_dirs,
+                };
+                match body.op.as_str() {
+                    $($server => Self::from_wire_kind($wire, payload)),+,
+                    _ => Err(format!("unsupported Runner file operation: {}", body.op)),
+                }
+            }
+        }
+    };
+}
+
+runner_file_operations!(
+    (Read, "file_read", "read"),
+    (Write, "file_write", "write"),
+    (List, "file_list", "list"),
+    (ListPage, "file_list_page", "list_page"),
+    (ProjectOverview, "file_project_overview", "project_overview"),
+    (
+        DeleteProjectFiles,
+        "file_delete_project_files",
+        "delete_project_files"
+    ),
+    (
+        WriteProjectFile,
+        "file_write_project_file",
+        "write_project_file"
+    ),
+    (ApplyTextEdits, "file_apply_text_edits", "apply_text_edits"),
+    (ApplyPatch, "file_apply_patch", "apply_patch"),
+    (
+        SaveProjectArtifact,
+        "file_save_project_artifact",
+        "save_project_artifact"
+    ),
+    (
+        ReadProjectArtifactMetadata,
+        "file_read_project_artifact_metadata",
+        "read_project_artifact_metadata"
+    ),
+    (
+        ReadProjectArtifact,
+        "file_read_project_artifact",
+        "read_project_artifact"
+    ),
+    (
+        ReadProjectArtifactExportChunk,
+        "file_read_project_artifact_export_chunk",
+        "read_project_artifact_export_chunk"
+    ),
+    (
+        ArtifactUploadBegin,
+        "file_artifact_upload_begin",
+        "artifact_upload_begin"
+    ),
+    (
+        ArtifactUploadChunk,
+        "file_artifact_upload_chunk",
+        "artifact_upload_chunk"
+    ),
+    (
+        ArtifactUploadFinish,
+        "file_artifact_upload_finish",
+        "artifact_upload_finish"
+    ),
+    (
+        ArtifactUploadAbort,
+        "file_artifact_upload_abort",
+        "artifact_upload_abort"
+    ),
+    (
+        CheckpointCreate,
+        "file_checkpoint_create",
+        "checkpoint_create"
+    ),
+    (
+        CheckpointRestore,
+        "file_checkpoint_restore",
+        "checkpoint_restore"
+    ),
+    (
+        SkillListPackages,
+        "file_skill_list_packages",
+        "skill_list_packages"
+    ),
+    (SkillReadFile, "file_skill_read_file", "skill_read_file"),
+);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunnerProjectOperationKind {
+    Register,
+    Create,
+    ResolveOrRegister,
+    PrepareManagedWorktree,
+    LifecycleEnable,
+    LifecycleDisable,
+    LifecycleUnregister,
+}
+
+impl RunnerProjectOperationKind {
+    pub fn wire_kind(self) -> &'static str {
+        match self {
+            Self::Register => "register_project",
+            Self::Create => "create_project",
+            Self::ResolveOrRegister => "resolve_or_register_project",
+            Self::PrepareManagedWorktree => "prepare_managed_worktree",
+            Self::LifecycleEnable => "project_lifecycle_enable",
+            Self::LifecycleDisable => "project_lifecycle_disable",
+            Self::LifecycleUnregister => "project_lifecycle_unregister",
+        }
+    }
+
+    pub fn from_wire(kind: &str) -> Option<Self> {
+        Some(match kind {
+            "register_project" => Self::Register,
+            "create_project" => Self::Create,
+            "resolve_or_register_project" => Self::ResolveOrRegister,
+            "prepare_managed_worktree" => Self::PrepareManagedWorktree,
+            "project_lifecycle_enable" => Self::LifecycleEnable,
+            "project_lifecycle_disable" => Self::LifecycleDisable,
+            "project_lifecycle_unregister" => Self::LifecycleUnregister,
+            _ => return None,
+        })
+    }
+
+    pub fn disables_execution(self) -> bool {
+        matches!(self, Self::LifecycleDisable | Self::LifecycleUnregister)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerProjectOperation {
+    pub kind: RunnerProjectOperationKind,
+    /// Existing V2 JSON payload carried in `stdin`.
+    pub payload: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunnerComputerOperationKind {
+    ListWindows,
+    ListApplications,
+    LaunchApplication,
+    ListDisplays,
+    SnapshotDisplay,
+    ReadClipboard,
+    WriteClipboard,
+    PointerMove,
+    PointerClick,
+    Snapshot,
+    SnapshotRegion,
+    AccessibilityStatus,
+    AccessibilityTree,
+    ElementState,
+    ActivateWindow,
+    Control,
+    ScrollToElement,
+    KeyInput,
+    InputText,
+}
+
+impl RunnerComputerOperationKind {
+    pub fn wire_kind(self) -> &'static str {
+        match self {
+            Self::ListWindows => "computer_list_windows",
+            Self::ListApplications => "computer_list_applications",
+            Self::LaunchApplication => "computer_launch_application",
+            Self::ListDisplays => "computer_list_displays",
+            Self::SnapshotDisplay => "computer_snapshot_display",
+            Self::ReadClipboard => "computer_read_clipboard",
+            Self::WriteClipboard => "computer_write_clipboard",
+            Self::PointerMove => "computer_pointer_move",
+            Self::PointerClick => "computer_pointer_click",
+            Self::Snapshot => "computer_snapshot",
+            Self::SnapshotRegion => "computer_snapshot_region",
+            Self::AccessibilityStatus => "computer_accessibility_status",
+            Self::AccessibilityTree => "computer_accessibility_tree",
+            Self::ElementState => "computer_element_state",
+            Self::ActivateWindow => "computer_activate_window",
+            Self::Control => "computer_control",
+            Self::ScrollToElement => "computer_scroll_to_element",
+            Self::KeyInput => "computer_key_input",
+            Self::InputText => "computer_input_text",
+        }
+    }
+
+    pub fn from_wire(kind: &str) -> Option<Self> {
+        Some(match kind {
+            "computer_list_windows" => Self::ListWindows,
+            "computer_list_applications" => Self::ListApplications,
+            "computer_launch_application" => Self::LaunchApplication,
+            "computer_list_displays" => Self::ListDisplays,
+            "computer_snapshot_display" => Self::SnapshotDisplay,
+            "computer_read_clipboard" => Self::ReadClipboard,
+            "computer_write_clipboard" => Self::WriteClipboard,
+            "computer_pointer_move" => Self::PointerMove,
+            "computer_pointer_click" => Self::PointerClick,
+            "computer_snapshot" => Self::Snapshot,
+            "computer_snapshot_region" => Self::SnapshotRegion,
+            "computer_accessibility_status" => Self::AccessibilityStatus,
+            "computer_accessibility_tree" => Self::AccessibilityTree,
+            "computer_element_state" => Self::ElementState,
+            "computer_activate_window" => Self::ActivateWindow,
+            "computer_control" => Self::Control,
+            "computer_scroll_to_element" => Self::ScrollToElement,
+            "computer_key_input" => Self::KeyInput,
+            "computer_input_text" => Self::InputText,
+            _ => return None,
+        })
+    }
+
+    pub fn is_large_image(self) -> bool {
+        matches!(self, Self::Snapshot | Self::SnapshotDisplay)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerComputerOperation {
+    pub kind: RunnerComputerOperationKind,
+    /// Existing bounded JSON payload carried in `stdin`.
+    pub payload: String,
+    pub timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunnerBrowserOperationKind {
+    DiscoverExternal,
+    AttachExternal,
+    LaunchManaged,
+    ResolveSurface,
+    ListBrowsers,
+    ListPages,
+    Snapshot,
+    Screenshot,
+    Console,
+    Network,
+    Diagnostics,
+    ClearDiagnostics,
+    Launch,
+    NewPage,
+    Navigate,
+    Reload,
+    Click,
+    InputText,
+    SelectOption,
+    SelectChoice,
+    SetDate,
+    SetValue,
+    UploadFile,
+    Batch,
+    Key,
+    ClosePage,
+    CloseBrowser,
+}
+
+impl RunnerBrowserOperationKind {
+    pub const fn max_payload_bytes(self) -> usize {
+        if matches!(self, Self::Batch) {
+            256 * 1024
+        } else {
+            32 * 1024
+        }
+    }
+
+    pub fn wire_kind(self) -> &'static str {
+        match self {
+            Self::DiscoverExternal => "browser_discover",
+            Self::AttachExternal => "browser_attach",
+            Self::LaunchManaged => "browser_launch_managed",
+            Self::ResolveSurface => "browser_surface",
+            Self::ListBrowsers => "browser_list_browsers",
+            Self::ListPages => "browser_list_pages",
+            Self::Snapshot => "browser_snapshot",
+            Self::Screenshot => "browser_screenshot",
+            Self::Console => "browser_console",
+            Self::Network => "browser_network",
+            Self::Diagnostics => "browser_diagnostics",
+            Self::ClearDiagnostics => "browser_clear_diagnostics",
+            Self::Launch => "browser_launch",
+            Self::NewPage => "browser_new_page",
+            Self::Navigate => "browser_navigate",
+            Self::Reload => "browser_reload",
+            Self::Click => "browser_click",
+            Self::InputText => "browser_input_text",
+            Self::SelectOption => "browser_select_option",
+            Self::SelectChoice => "browser_select_choice",
+            Self::SetDate => "browser_set_date",
+            Self::SetValue => "browser_set_value",
+            Self::UploadFile => "browser_upload_file",
+            Self::Batch => "browser_batch",
+            Self::Key => "browser_key",
+            Self::ClosePage => "browser_close_page",
+            Self::CloseBrowser => "browser_close",
+        }
+    }
+
+    pub fn from_wire(kind: &str) -> Option<Self> {
+        Some(match kind {
+            "browser_discover" => Self::DiscoverExternal,
+            "browser_attach" => Self::AttachExternal,
+            "browser_launch_managed" => Self::LaunchManaged,
+            "browser_surface" => Self::ResolveSurface,
+            "browser_list_browsers" => Self::ListBrowsers,
+            "browser_list_pages" => Self::ListPages,
+            "browser_snapshot" => Self::Snapshot,
+            "browser_screenshot" => Self::Screenshot,
+            "browser_console" => Self::Console,
+            "browser_network" => Self::Network,
+            "browser_diagnostics" => Self::Diagnostics,
+            "browser_clear_diagnostics" => Self::ClearDiagnostics,
+            "browser_launch" => Self::Launch,
+            "browser_new_page" => Self::NewPage,
+            "browser_navigate" => Self::Navigate,
+            "browser_reload" => Self::Reload,
+            "browser_click" => Self::Click,
+            "browser_input_text" => Self::InputText,
+            "browser_select_option" => Self::SelectOption,
+            "browser_select_choice" => Self::SelectChoice,
+            "browser_set_date" => Self::SetDate,
+            "browser_set_value" => Self::SetValue,
+            "browser_upload_file" => Self::UploadFile,
+            "browser_batch" => Self::Batch,
+            "browser_key" => Self::Key,
+            "browser_close_page" => Self::ClosePage,
+            "browser_close" => Self::CloseBrowser,
+            _ => return None,
+        })
+    }
+
+    /// Composite widget actions require explicit support, including inside a batch.
+    /// Inspect the canonical operation field only; values never become operation names.
+    pub fn requires_complex_controls(self, payload: &serde_json::Value) -> bool {
+        match self {
+            Self::SelectChoice | Self::SetDate => true,
+            Self::Batch => payload
+                .get("operations")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|operations| {
+                    operations.iter().any(|operation| {
+                        matches!(
+                            operation.get("action").and_then(serde_json::Value::as_str),
+                            Some("select_choice" | "set_date")
+                        )
+                    })
+                }),
+            _ => false,
+        }
+    }
+
+    pub fn is_large_image(self) -> bool {
+        matches!(self, Self::Screenshot)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerBrowserOperation {
+    pub kind: RunnerBrowserOperationKind,
+    pub payload: String,
+    pub timeout_secs: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunnerPersistentShellOperation {
+    pub request: PersistentShellRequest,
+    pub job_context: Option<ShellJobContext>,
+}
+
+/// Closed canonical Runner operation. Variants carry the payload required to
+/// execute that operation; callers never reconstruct semantics from optional V2
+/// fields.
+#[derive(Debug, Clone)]
+pub enum RunnerOperation {
+    RunShell(RunnerShellOperation),
+    RunProcess(RunnerProcessOperation),
+    RunScript(RunnerScriptOperation),
+    RunInternalPosixScript(RunnerScriptOperation),
+    RunSkillResource(RunnerSkillResourceOperation),
+    Job(RunnerJobOperation),
+    JobInput(crate::job_input::JobInputRequest),
+    File(RunnerFileOperation),
+    Project(RunnerProjectOperation),
+    Computer(RunnerComputerOperation),
+    Browser(RunnerBrowserOperation),
+    PlanProjectValidation(crate::project_validation::ProjectValidationRequest),
+    PlanProjectBuild(crate::project_build::ProjectBuildRequest),
+    PlanProjectFormat(crate::project_format::ProjectFormatRequest),
+    Validation {
+        payload: ValidationBridgeRequest,
+        timeout_secs: u64,
+    },
+    Lsp {
+        payload: RunnerLspPayload,
+        timeout_secs: u64,
+    },
+    PersistentShell(RunnerPersistentShellOperation),
+    McpGateway(McpGatewayRequest),
+    PluginGateway(PluginGatewayRequest),
+    CodingAgent(CodingAgentRequest),
+    Skill(RunnerSkillRequest),
+    SshResource(SshResourceRequest),
+    RunnerConfig(RunnerConfigOperationRequest),
+    RunnerInstruction(RunnerInstructionRequest),
+}
+
+impl RunnerOperation {
+    pub fn wire_kind(&self) -> &'static str {
+        match self {
+            Self::RunShell(_) => "run_shell",
+            Self::RunProcess(_) => "run_process",
+            Self::RunScript(_) => "run_script",
+            Self::RunInternalPosixScript(_) => "run_internal_posix_script",
+            Self::RunSkillResource(_) => RUNNER_SKILL_EXECUTION_REQUEST_KIND,
+            Self::JobInput(_) => "job_write_input",
+            Self::Job(operation) => match operation {
+                RunnerJobOperation::StartShell(_) => "start_job",
+                RunnerJobOperation::StartValidation(_) => "start_validation_job",
+                RunnerJobOperation::StartBuild(_) => "start_build_job",
+                RunnerJobOperation::StartFormat(_) => "start_format_job",
+                RunnerJobOperation::StartProcess(_) => "start_process_job",
+                RunnerJobOperation::StartInteractiveProcess(_) => "start_interactive_process_job",
+                RunnerJobOperation::StartDetachedProcess(_) => "start_detached_process_job",
+                RunnerJobOperation::StartScript(_) => "start_script_job",
+                RunnerJobOperation::StartSkillResource(_) => "start_skill_resource_job",
+                RunnerJobOperation::Stop { .. } => "stop_job",
+            },
+            Self::File(operation) => operation.wire_kind(),
+            Self::Project(operation) => operation.kind.wire_kind(),
+            Self::Computer(operation) => operation.kind.wire_kind(),
+            Self::Browser(operation) => operation.kind.wire_kind(),
+            Self::PlanProjectValidation(_) => "plan_project_validation",
+            Self::PlanProjectBuild(_) => "plan_project_build",
+            Self::PlanProjectFormat(_) => "plan_project_format",
+            Self::Validation { .. } => crate::validation_bridge::AGENT_VALIDATION_REQUEST_KIND,
+            Self::Lsp { .. } => crate::lsp_bridge::AGENT_LSP_REQUEST_KIND,
+            Self::PersistentShell(_) => "persistent_shell",
+            Self::McpGateway(_) => "mcp_gateway",
+            Self::PluginGateway(_) => "plugin_gateway",
+            Self::CodingAgent(_) => "coding_agent",
+            Self::Skill(_) => RUNNER_SKILL_REQUEST_KIND,
+            Self::SshResource(_) => "ssh_resource",
+            Self::RunnerConfig(_) => RUNNER_CONFIG_REQUEST_KIND,
+            Self::RunnerInstruction(_) => RUNNER_INSTRUCTION_REQUEST_KIND,
+        }
+    }
+
+    pub fn job(&self) -> Option<&RunnerJobOperation> {
+        match self {
+            Self::Job(operation) => Some(operation),
+            _ => None,
+        }
+    }
+
+    pub fn is_large_native_image_request(&self) -> bool {
+        match self {
+            Self::Computer(operation) => operation.kind.is_large_image(),
+            Self::Browser(operation) => operation.kind.is_large_image(),
+            Self::File(RunnerFileOperation::ReadProjectArtifact(payload)) => payload
+                .content
+                .as_deref()
+                .and_then(|content| serde_json::from_str::<serde_json::Value>(content).ok())
+                .and_then(|value| value.get("mcp_image").and_then(serde_json::Value::as_bool))
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+
+    pub fn is_large_internal_artifact_chunk_request(&self) -> bool {
+        matches!(
+            self,
+            Self::File(RunnerFileOperation::ReadProjectArtifactExportChunk(_))
+        )
+    }
+}
+
+impl RunnerRequest {
+    /// Decode and validate the V2 optional-field bag into one canonical closed
+    /// semantic operation. Explicit unknown kinds and conflicting payloads fail
+    /// closed. A *missing* `kind` still reaches this method as `run_shell`
+    /// because the historical serde default remains on `RunnerRequest.kind`.
+    pub fn decode_operation(&self) -> Result<RunnerOperation, String> {
+        decode_operation(self)
+    }
+
+    pub fn decode_invocation(&self) -> Result<RunnerInvocation, String> {
+        Ok(RunnerInvocation {
+            metadata: RunnerInvocationMetadata {
+                request_id: self.request_id.clone(),
+                client_id: self.client_id.clone(),
+                requested_by: self.requested_by.clone(),
+                created_at: self.created_at,
+            },
+            operation: self.decode_operation()?,
+        })
+    }
+
+    pub fn from_operation(
+        metadata: RunnerInvocationMetadata,
+        operation: RunnerOperation,
+    ) -> Result<Self, String> {
+        RunnerInvocation {
+            metadata,
+            operation,
+        }
+        .into_v2_request()
+    }
+}
+
+impl RunnerInvocation {
+    pub fn into_v2_request(self) -> Result<RunnerRequest, String> {
+        encode_operation(self.metadata, self.operation)
+    }
+}
+
+fn empty_wire(metadata: RunnerInvocationMetadata, kind: &str, timeout_secs: u64) -> RunnerRequest {
+    RunnerRequest {
+        request_id: metadata.request_id,
+        client_id: metadata.client_id,
+        kind: kind.to_string(),
+        job_id: None,
+        cwd: None,
+        path: None,
+        content: None,
+        max_bytes: None,
+        expected_sha256: None,
+        expected_prefix: None,
+        start_line: None,
+        end_line: None,
+        create_dirs: false,
+        command: String::new(),
+        shell: None,
+        login: false,
+        process: None,
+        script: None,
+        stdin: None,
+        timeout_secs,
+        requested_by: metadata.requested_by,
+        created_at: metadata.created_at,
+        validation: None,
+        lsp: None,
+        job_context: None,
+        persistent_shell: None,
+        mcp_gateway: None,
+        plugin_gateway: None,
+        coding_agent: None,
+    }
+}
+
+fn encode_operation(
+    metadata: RunnerInvocationMetadata,
+    operation: RunnerOperation,
+) -> Result<RunnerRequest, String> {
+    let kind = operation.wire_kind();
+    let mut wire = empty_wire(metadata, kind, 30);
+    match operation {
+        RunnerOperation::RunShell(operation) => {
+            validate_raw_shell_wire_command(&operation.command)?;
+            if operation.login
+                && operation.shell != Some(crate::workflow_session_contract::ExecutionShell::Bash)
+            {
+                return Err("bash login mode requires shell=bash".to_string());
+            }
+            wire.cwd = operation.cwd;
+            wire.command = operation.command;
+            wire.shell = operation.shell;
+            wire.login = operation.login;
+            wire.stdin = operation.stdin;
+            wire.max_bytes = operation.max_bytes;
+            wire.timeout_secs = operation.timeout_secs;
+            wire.job_context = operation.job_context;
+        }
+        RunnerOperation::RunProcess(operation) => {
+            validate_direct_process(&operation)?;
+            wire.cwd = operation.cwd;
+            wire.process = Some(operation.process);
+            wire.stdin = operation.stdin;
+            wire.timeout_secs = operation.timeout_secs;
+        }
+        RunnerOperation::RunScript(operation) => {
+            validate_direct_script(&operation, false)?;
+            wire.cwd = operation.cwd;
+            wire.script = Some(operation.script);
+            wire.stdin = operation.stdin;
+            wire.timeout_secs = operation.timeout_secs;
+        }
+        RunnerOperation::RunInternalPosixScript(operation) => {
+            validate_direct_script(&operation, true)?;
+            wire.cwd = operation.cwd;
+            wire.script = Some(operation.script);
+            wire.timeout_secs = operation.timeout_secs;
+        }
+        RunnerOperation::RunSkillResource(operation) => {
+            operation
+                .request
+                .validate()
+                .map_err(|error| format!("invalid Runner Skill execution request: {error}"))?;
+            validate_direct_structured_common(
+                operation.cwd.as_deref(),
+                None,
+                operation.timeout_secs,
+            )?;
+            let content = serde_json::to_string(&operation.request).map_err(|error| {
+                format!("could not encode Runner Skill execution request: {error}")
+            })?;
+            if content.len() > RUNNER_SKILL_EXECUTION_REQUEST_MAX_BYTES {
+                return Err("Runner Skill execution request exceeds V2 payload bound".to_string());
+            }
+            wire.cwd = operation.cwd;
+            wire.content = Some(content);
+            wire.timeout_secs = operation.timeout_secs;
+        }
+        RunnerOperation::JobInput(input) => {
+            input.validate()?;
+            wire.content = Some(serde_json::to_string(&input).map_err(|_| "job_input_encode")?);
+            wire.timeout_secs = 3;
+        }
+        RunnerOperation::Job(operation) => encode_job_operation(&mut wire, operation)?,
+        RunnerOperation::File(operation) => {
+            let payload = operation.payload().clone();
+            validate_file_payload(operation.wire_kind(), &payload)?;
+            wire.kind = operation.wire_kind().to_string();
+            wire.cwd = payload.cwd;
+            wire.path = Some(payload.path);
+            wire.content = payload.content;
+            wire.max_bytes = payload.max_bytes;
+            wire.expected_sha256 = payload.expected_sha256;
+            wire.expected_prefix = payload.expected_prefix;
+            wire.start_line = payload.start_line;
+            wire.end_line = payload.end_line;
+            wire.create_dirs = payload.create_dirs;
+            wire.timeout_secs = 30;
+        }
+        RunnerOperation::Project(operation) => {
+            validate_json_payload(&operation.payload, "project operation")?;
+            wire.kind = operation.kind.wire_kind().to_string();
+            wire.stdin = Some(operation.payload);
+            wire.timeout_secs = 30;
+        }
+        RunnerOperation::Computer(operation) => {
+            validate_computer_payload(operation.kind, &operation.payload)?;
+            wire.kind = operation.kind.wire_kind().to_string();
+            wire.stdin = Some(operation.payload);
+            wire.timeout_secs = operation.timeout_secs.max(1);
+        }
+        RunnerOperation::Browser(operation) => {
+            validate_browser_payload(operation.kind, &operation.payload)?;
+            wire.kind = operation.kind.wire_kind().to_string();
+            wire.stdin = Some(operation.payload);
+            wire.timeout_secs = operation.timeout_secs.max(1);
+        }
+        RunnerOperation::PlanProjectValidation(payload) => {
+            payload.validate()?;
+            wire.content = Some(serde_json::to_string(&payload).map_err(|e| e.to_string())?);
+            wire.timeout_secs = 30;
+        }
+        RunnerOperation::PlanProjectBuild(payload) => {
+            payload.validate()?;
+            wire.content = Some(serde_json::to_string(&payload).map_err(|e| e.to_string())?);
+            wire.timeout_secs = 30;
+        }
+        RunnerOperation::PlanProjectFormat(payload) => {
+            payload.validate()?;
+            wire.content = Some(serde_json::to_string(&payload).map_err(|e| e.to_string())?);
+            wire.timeout_secs = 30;
+        }
+        RunnerOperation::Validation {
+            payload,
+            timeout_secs,
+        } => {
+            validate_bridge_request(&payload)?;
+            wire.validation = Some(payload);
+            wire.timeout_secs = timeout_secs;
+        }
+        RunnerOperation::Lsp {
+            payload,
+            timeout_secs,
+        } => {
+            wire.lsp = Some(payload);
+            wire.timeout_secs = timeout_secs.max(1);
+        }
+        RunnerOperation::PersistentShell(operation) => {
+            validate_persistent_shell(&operation.request)?;
+            wire.cwd = operation.request.cwd.clone();
+            wire.command = operation.request.command.clone().unwrap_or_default();
+            wire.timeout_secs = operation.request.timeout_secs.unwrap_or(30);
+            wire.job_context = operation.job_context;
+            wire.persistent_shell = Some(operation.request);
+        }
+        RunnerOperation::McpGateway(operation) => {
+            validate_mcp_gateway_request(&operation)
+                .map_err(|error| format!("invalid MCP gateway request: {error}"))?;
+            wire.timeout_secs = 120;
+            wire.mcp_gateway = Some(operation);
+        }
+        RunnerOperation::PluginGateway(operation) => {
+            validate_plugin_gateway_request(&operation)
+                .map_err(|error| format!("invalid Plugin gateway request: {error}"))?;
+            wire.timeout_secs = 120;
+            wire.plugin_gateway = Some(operation);
+        }
+        RunnerOperation::CodingAgent(operation) => {
+            validate_coding_agent_request(&operation)
+                .map_err(|error| format!("invalid CodingAgent request: {error}"))?;
+            wire.timeout_secs = 120;
+            wire.coding_agent = Some(operation);
+        }
+        RunnerOperation::Skill(operation) => {
+            operation
+                .validate()
+                .map_err(|error| format!("invalid Runner Skill request: {error}"))?;
+            let management = operation.requires_management_capability();
+            let content = serde_json::to_string(&operation)
+                .map_err(|error| format!("could not encode Runner Skill request: {error}"))?;
+            if content.len() > RUNNER_SKILL_REQUEST_MAX_BYTES {
+                return Err("Runner Skill request exceeds V2 payload bound".to_string());
+            }
+            wire.content = Some(content);
+            wire.timeout_secs = if management { 120 } else { 30 };
+        }
+        RunnerOperation::SshResource(operation) => {
+            operation
+                .validate()
+                .map_err(|error| format!("invalid SSH resource request: {error}"))?;
+            let content = serde_json::to_string(&operation)
+                .map_err(|error| format!("could not encode SSH resource request: {error}"))?;
+            if content.len() > SSH_RESOURCE_REQUEST_MAX_BYTES {
+                return Err("SSH resource request exceeds V2 payload bound".to_string());
+            }
+            wire.content = Some(content);
+            wire.timeout_secs = 60;
+        }
+        RunnerOperation::RunnerInstruction(operation) => {
+            operation
+                .validate()
+                .map_err(|error| format!("invalid Runner instruction request: {error}"))?;
+            let content = serde_json::to_string(&operation)
+                .map_err(|error| format!("could not encode Runner instruction request: {error}"))?;
+            if content.len() > RUNNER_INSTRUCTION_REQUEST_MAX_BYTES {
+                return Err("Runner instruction request exceeds V2 payload bound".to_string());
+            }
+            wire.content = Some(content);
+            wire.timeout_secs = 30;
+        }
+        RunnerOperation::RunnerConfig(operation) => {
+            operation
+                .validate()
+                .map_err(|error| format!("invalid Runner config request: {error}"))?;
+            let content = serde_json::to_string(&operation)
+                .map_err(|error| format!("could not encode Runner config request: {error}"))?;
+            if content.len() > RUNNER_CONFIG_REQUEST_MAX_BYTES {
+                return Err("Runner config request exceeds V2 payload bound".to_string());
+            }
+            wire.content = Some(content);
+            wire.timeout_secs = 30;
+        }
+    }
+    Ok(wire)
+}
+
+fn encode_job_operation(
+    wire: &mut RunnerRequest,
+    operation: RunnerJobOperation,
+) -> Result<(), String> {
+    wire.kind = match &operation {
+        RunnerJobOperation::StartShell(_) => "start_job",
+        RunnerJobOperation::StartValidation(_) => "start_validation_job",
+        RunnerJobOperation::StartBuild(_) => "start_build_job",
+        RunnerJobOperation::StartFormat(_) => "start_format_job",
+        RunnerJobOperation::StartProcess(_) => "start_process_job",
+        RunnerJobOperation::StartInteractiveProcess(_) => "start_interactive_process_job",
+        RunnerJobOperation::StartDetachedProcess(_) => "start_detached_process_job",
+        RunnerJobOperation::StartScript(_) => "start_script_job",
+        RunnerJobOperation::StartSkillResource(_) => "start_skill_resource_job",
+        RunnerJobOperation::Stop { .. } => "stop_job",
+    }
+    .to_string();
+    match operation {
+        RunnerJobOperation::StartShell(operation) => {
+            validate_raw_shell_wire_command(&operation.command)?;
+            if operation.login
+                && operation.shell != Some(crate::workflow_session_contract::ExecutionShell::Bash)
+            {
+                return Err("bash login mode requires shell=bash".to_string());
+            }
+            validate_job_context_coherence(operation.cwd.as_deref(), &operation.context)?;
+            wire.job_id = Some(operation.job_id);
+            wire.cwd = operation.cwd;
+            wire.command = operation.command;
+            wire.shell = operation.shell;
+            wire.login = operation.login;
+            wire.timeout_secs = operation.timeout_secs;
+            wire.job_context = Some(operation.context);
+        }
+        RunnerJobOperation::StartValidation(operation) => {
+            validate_validation_steps(&operation.steps, operation.context.validation.as_ref())?;
+            validate_job_context_coherence(operation.cwd.as_deref(), &operation.context)?;
+            let names = operation
+                .steps
+                .iter()
+                .map(|step| step.name.clone())
+                .collect::<Vec<_>>();
+            if operation.context.validation_steps != names {
+                return Err("Job validation context does not match operation steps".to_string());
+            }
+            wire.job_id = Some(operation.job_id);
+            wire.cwd = operation.cwd;
+            wire.command = serde_json::to_string(&operation.steps)
+                .map_err(|error| format!("could not encode validation Job plan: {error}"))?;
+            wire.timeout_secs = operation.timeout_secs;
+            wire.job_context = Some(operation.context);
+        }
+        RunnerJobOperation::StartFormat(operation) => {
+            validate_structured_job_common(
+                operation.cwd.as_deref(),
+                None,
+                operation.timeout_secs,
+                crate::project_format::PROJECT_FORMAT_TIMEOUT_MAX_SECS,
+            )?;
+            validate_job_context_coherence(operation.cwd.as_deref(), &operation.context)?;
+            operation.plan.digest().map_err(str::to_string)?;
+            if operation.context.ssh_resource.is_some()
+                || operation.context.structured_execution
+                    != Some(crate::project_format::structured_metadata())
+                || !operation.context.validation_steps.is_empty()
+                || operation.context.validation.is_some()
+            {
+                return Err("invalid project format Job context".into());
+            }
+            wire.job_id = Some(operation.job_id);
+            wire.cwd = operation.cwd;
+            wire.content =
+                Some(serde_json::to_string(&operation.plan).map_err(|_| "invalid format plan")?);
+            wire.timeout_secs = operation.timeout_secs;
+            wire.job_context = Some(operation.context);
+        }
+        RunnerJobOperation::StartBuild(operation) => {
+            validate_structured_job_common(
+                operation.cwd.as_deref(),
+                None,
+                operation.timeout_secs,
+                PROCESS_TIMEOUT_MAX_SECS,
+            )?;
+            validate_process_argv(&operation.process)?;
+            validate_job_context_coherence(operation.cwd.as_deref(), &operation.context)?;
+            validate_project_build_job(
+                &operation.process,
+                &operation.provenance,
+                &operation.context,
+            )?;
+            let content = serde_json::to_string(&operation.provenance)
+                .map_err(|error| format!("could not encode project build provenance: {error}"))?;
+            if content.len() > crate::project_build::PROJECT_BUILD_PROVENANCE_MAX_BYTES {
+                return Err("project build provenance exceeds V2 payload bound".to_string());
+            }
+            wire.job_id = Some(operation.job_id);
+            wire.cwd = operation.cwd;
+            wire.process = Some(operation.process);
+            wire.content = Some(content);
+            wire.timeout_secs = operation.timeout_secs;
+            wire.job_context = Some(operation.context);
+        }
+        RunnerJobOperation::StartProcess(operation)
+        | RunnerJobOperation::StartInteractiveProcess(operation)
+        | RunnerJobOperation::StartDetachedProcess(operation) => {
+            validate_structured_job_common(
+                operation.cwd.as_deref(),
+                operation.stdin.as_deref(),
+                operation.timeout_secs,
+                PROCESS_TIMEOUT_MAX_SECS,
+            )?;
+            validate_process_argv(&operation.process)?;
+            validate_job_context_coherence(operation.cwd.as_deref(), &operation.context)?;
+            wire.job_id = Some(operation.job_id);
+            wire.cwd = operation.cwd;
+            wire.process = Some(operation.process);
+            wire.stdin = operation.stdin;
+            wire.timeout_secs = operation.timeout_secs;
+            wire.job_context = Some(operation.context);
+        }
+        RunnerJobOperation::StartScript(operation) => {
+            validate_script_request(
+                &operation.script,
+                operation.stdin.as_deref(),
+                operation.cwd.as_deref(),
+                operation.timeout_secs,
+            )?;
+            validate_job_context_coherence(operation.cwd.as_deref(), &operation.context)?;
+            wire.job_id = Some(operation.job_id);
+            wire.cwd = operation.cwd;
+            wire.script = Some(operation.script);
+            wire.stdin = operation.stdin;
+            wire.timeout_secs = operation.timeout_secs;
+            wire.job_context = Some(operation.context);
+        }
+        RunnerJobOperation::StartSkillResource(operation) => {
+            operation
+                .request
+                .validate()
+                .map_err(|error| format!("invalid Runner Skill execution request: {error}"))?;
+            validate_structured_job_common(
+                operation.cwd.as_deref(),
+                None,
+                operation.timeout_secs,
+                STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS,
+            )?;
+            validate_job_context_coherence(operation.cwd.as_deref(), &operation.context)?;
+            let content = serde_json::to_string(&operation.request).map_err(|error| {
+                format!("could not encode Runner Skill execution request: {error}")
+            })?;
+            if content.len() > RUNNER_SKILL_EXECUTION_REQUEST_MAX_BYTES {
+                return Err("Runner Skill execution request exceeds V2 payload bound".to_string());
+            }
+            wire.job_id = Some(operation.job_id);
+            wire.cwd = operation.cwd;
+            wire.content = Some(content);
+            wire.timeout_secs = operation.timeout_secs;
+            wire.job_context = Some(operation.context);
+        }
+        RunnerJobOperation::Stop { job_id } => {
+            wire.job_id = Some(job_id);
+            wire.timeout_secs = 1;
+        }
+    }
+    Ok(())
+}
+
+fn decode_operation(wire: &RunnerRequest) -> Result<RunnerOperation, String> {
+    if wire.login
+        && (!matches!(wire.kind.as_str(), "run_shell" | "start_job")
+            || wire.shell != Some(crate::workflow_session_contract::ExecutionShell::Bash))
+    {
+        return Err("bash login mode requires raw shell=bash".to_string());
+    }
+    if wire.shell.is_some() && !matches!(wire.kind.as_str(), "run_shell" | "start_job") {
+        return Err(format!(
+            "{} does not accept the raw-shell selector",
+            wire.kind
+        ));
+    }
+    let no_special = || ensure_special_payloads_absent(wire);
+    match wire.kind.as_str() {
+        "job_write_input" => {
+            no_special()?;
+            ensure_no_file_fields_except_content(wire)?;
+            if wire.job_id.is_some()
+                || wire.job_context.is_some()
+                || wire.cwd.is_some()
+                || wire.stdin.is_some()
+                || !wire.command.is_empty()
+            {
+                return Err("job_input_incompatible_fields".into());
+            }
+            let input: crate::job_input::JobInputRequest = serde_json::from_str(bounded_content(
+                wire,
+                crate::job_input::MAX_BYTES * 6 + 2048,
+                "job input",
+            )?)
+            .map_err(|_| "job_input_invalid_payload")?;
+            input.validate()?;
+            Ok(RunnerOperation::JobInput(input))
+        }
+        "run_shell" => {
+            no_special()?;
+            ensure_no_file_fields_except_max_bytes(wire)?;
+            if wire.job_id.is_some() {
+                return Err("run_shell does not accept job_id".to_string());
+            }
+            validate_raw_shell_wire_command(&wire.command)?;
+            if let Some(context) = wire.job_context.as_ref() {
+                validate_job_context_coherence(wire.cwd.as_deref(), context)?;
+            }
+            Ok(RunnerOperation::RunShell(RunnerShellOperation {
+                cwd: wire.cwd.clone(),
+                command: wire.command.clone(),
+                shell: wire.shell,
+                login: wire.login,
+                stdin: wire.stdin.clone(),
+                max_bytes: wire.max_bytes,
+                timeout_secs: wire.timeout_secs,
+                job_context: wire.job_context.clone(),
+            }))
+        }
+        "run_process" => {
+            ensure_only_process_payload(wire)?;
+            ensure_no_file_fields(wire)?;
+            if wire.job_id.is_some() || wire.job_context.is_some() || !wire.command.is_empty() {
+                return Err("run_process contains incompatible execution fields".to_string());
+            }
+            let operation = RunnerProcessOperation {
+                cwd: wire.cwd.clone(),
+                process: wire
+                    .process
+                    .clone()
+                    .ok_or_else(|| "run_process requires process payload".to_string())?,
+                stdin: wire.stdin.clone(),
+                timeout_secs: wire.timeout_secs,
+            };
+            validate_direct_process(&operation)?;
+            Ok(RunnerOperation::RunProcess(operation))
+        }
+        "run_script" | "run_internal_posix_script" => {
+            ensure_only_script_payload(wire)?;
+            ensure_no_file_fields(wire)?;
+            if wire.job_id.is_some() || wire.job_context.is_some() || !wire.command.is_empty() {
+                return Err(format!(
+                    "{} contains incompatible execution fields",
+                    wire.kind
+                ));
+            }
+            let operation = RunnerScriptOperation {
+                cwd: wire.cwd.clone(),
+                script: wire
+                    .script
+                    .clone()
+                    .ok_or_else(|| format!("{} requires script payload", wire.kind))?,
+                stdin: wire.stdin.clone(),
+                timeout_secs: wire.timeout_secs,
+            };
+            let internal = wire.kind == "run_internal_posix_script";
+            validate_direct_script(&operation, internal)?;
+            Ok(if internal {
+                RunnerOperation::RunInternalPosixScript(operation)
+            } else {
+                RunnerOperation::RunScript(operation)
+            })
+        }
+        RUNNER_SKILL_EXECUTION_REQUEST_KIND => {
+            ensure_special_payloads_absent(wire)?;
+            ensure_no_file_fields_except_content(wire)?;
+            if wire.job_id.is_some()
+                || wire.job_context.is_some()
+                || !wire.command.is_empty()
+                || wire.stdin.is_some()
+            {
+                return Err(
+                    "skill_resource_execution contains incompatible execution fields".to_string(),
+                );
+            }
+            let content = bounded_content(
+                wire,
+                RUNNER_SKILL_EXECUTION_REQUEST_MAX_BYTES,
+                RUNNER_SKILL_EXECUTION_REQUEST_KIND,
+            )?;
+            let request = serde_json::from_str::<RunnerSkillExecutionRequest>(content)
+                .map_err(|error| format!("invalid Runner Skill execution payload: {error}"))?;
+            request
+                .validate()
+                .map_err(|error| format!("invalid Runner Skill execution request: {error}"))?;
+            validate_direct_structured_common(wire.cwd.as_deref(), None, wire.timeout_secs)?;
+            Ok(RunnerOperation::RunSkillResource(
+                RunnerSkillResourceOperation {
+                    cwd: wire.cwd.clone(),
+                    request,
+                    timeout_secs: wire.timeout_secs,
+                },
+            ))
+        }
+        "start_job"
+        | "start_validation_job"
+        | "start_build_job"
+        | "start_format_job"
+        | "start_process_job"
+        | "start_interactive_process_job"
+        | "start_detached_process_job"
+        | "start_script_job"
+        | "start_skill_resource_job"
+        | "stop_job" => decode_job_operation(wire).map(RunnerOperation::Job),
+        kind if kind.starts_with("file_") => {
+            ensure_special_payloads_absent(wire)?;
+            if wire.job_id.is_some()
+                || wire.stdin.is_some()
+                || wire.job_context.is_some()
+                || !wire.command.is_empty()
+            {
+                return Err("file operation contains incompatible execution fields".to_string());
+            }
+            let path = wire
+                .path
+                .clone()
+                .ok_or_else(|| "file operation requires path".to_string())?;
+            RunnerFileOperation::from_wire_kind(
+                kind,
+                RunnerFilePayload {
+                    cwd: wire.cwd.clone(),
+                    path,
+                    content: wire.content.clone(),
+                    max_bytes: wire.max_bytes,
+                    expected_sha256: wire.expected_sha256.clone(),
+                    expected_prefix: wire.expected_prefix.clone(),
+                    start_line: wire.start_line,
+                    end_line: wire.end_line,
+                    create_dirs: wire.create_dirs,
+                },
+            )
+            .map(RunnerOperation::File)
+        }
+        kind if RunnerProjectOperationKind::from_wire(kind).is_some() => {
+            ensure_special_payloads_absent(wire)?;
+            ensure_no_file_fields(wire)?;
+            if wire.job_id.is_some()
+                || wire.cwd.is_some()
+                || !wire.command.is_empty()
+                || wire.job_context.is_some()
+            {
+                return Err("project operation contains incompatible execution fields".to_string());
+            }
+            let payload = wire
+                .stdin
+                .clone()
+                .ok_or_else(|| "project operation requires JSON payload".to_string())?;
+            validate_json_payload(&payload, "project operation")?;
+            Ok(RunnerOperation::Project(RunnerProjectOperation {
+                kind: RunnerProjectOperationKind::from_wire(kind).expect("checked project kind"),
+                payload,
+            }))
+        }
+        kind if RunnerComputerOperationKind::from_wire(kind).is_some() => {
+            ensure_special_payloads_absent(wire)?;
+            ensure_no_file_fields(wire)?;
+            if wire.job_id.is_some()
+                || wire.cwd.is_some()
+                || !wire.command.is_empty()
+                || wire.job_context.is_some()
+            {
+                return Err("computer operation contains incompatible execution fields".to_string());
+            }
+            let operation_kind =
+                RunnerComputerOperationKind::from_wire(kind).expect("checked computer kind");
+            let payload = wire
+                .stdin
+                .clone()
+                .ok_or_else(|| "computer operation requires JSON payload".to_string())?;
+            validate_computer_payload(operation_kind, &payload)?;
+            Ok(RunnerOperation::Computer(RunnerComputerOperation {
+                kind: operation_kind,
+                payload,
+                timeout_secs: wire.timeout_secs,
+            }))
+        }
+        kind if RunnerBrowserOperationKind::from_wire(kind).is_some() => {
+            ensure_special_payloads_absent(wire)?;
+            ensure_no_file_fields(wire)?;
+            if wire.job_id.is_some()
+                || wire.cwd.is_some()
+                || !wire.command.is_empty()
+                || wire.job_context.is_some()
+            {
+                return Err("browser operation contains incompatible execution fields".to_string());
+            }
+            let operation_kind =
+                RunnerBrowserOperationKind::from_wire(kind).expect("checked browser kind");
+            let payload = wire
+                .stdin
+                .clone()
+                .ok_or_else(|| "browser operation requires JSON payload".to_string())?;
+            validate_browser_payload(operation_kind, &payload)?;
+            Ok(RunnerOperation::Browser(RunnerBrowserOperation {
+                kind: operation_kind,
+                payload,
+                timeout_secs: wire.timeout_secs,
+            }))
+        }
+        "plan_project_validation" => {
+            ensure_special_payloads_absent(wire)?;
+            if !wire.command.is_empty()
+                || wire.cwd.is_some()
+                || wire.stdin.is_some()
+                || wire.job_context.is_some()
+                || wire.shell.is_some()
+                || wire.login
+            {
+                return Err("project validation planning contains execution fields".into());
+            }
+            let payload: crate::project_validation::ProjectValidationRequest =
+                serde_json::from_str(
+                    wire.content
+                        .as_deref()
+                        .ok_or("project validation request missing")?,
+                )
+                .map_err(|e| e.to_string())?;
+            payload.validate()?;
+            Ok(RunnerOperation::PlanProjectValidation(payload))
+        }
+        "plan_project_build" => {
+            ensure_special_payloads_absent(wire)?;
+            if !wire.command.is_empty()
+                || wire.cwd.is_some()
+                || wire.stdin.is_some()
+                || wire.job_context.is_some()
+                || wire.shell.is_some()
+                || wire.login
+            {
+                return Err("project build planning contains execution fields".into());
+            }
+            let payload: crate::project_build::ProjectBuildRequest = serde_json::from_str(
+                wire.content
+                    .as_deref()
+                    .ok_or("project build request missing")?,
+            )
+            .map_err(|e| e.to_string())?;
+            payload.validate()?;
+            Ok(RunnerOperation::PlanProjectBuild(payload))
+        }
+        "plan_project_format" => {
+            ensure_special_payloads_absent(wire)?;
+            ensure_no_file_fields_except_content(wire)?;
+            if !wire.command.is_empty()
+                || wire.cwd.is_some()
+                || wire.stdin.is_some()
+                || wire.job_context.is_some()
+                || wire.job_id.is_some()
+                || wire.shell.is_some()
+                || wire.login
+            {
+                return Err("project format planning contains execution fields".into());
+            }
+            let payload: crate::project_format::ProjectFormatRequest =
+                serde_json::from_str(bounded_content(
+                    wire,
+                    crate::project_format::PROJECT_FORMAT_PLAN_MAX_BYTES,
+                    "project format request",
+                )?)
+                .map_err(|e| e.to_string())?;
+            payload.validate()?;
+            Ok(RunnerOperation::PlanProjectFormat(payload))
+        }
+        crate::validation_bridge::AGENT_VALIDATION_REQUEST_KIND => {
+            ensure_only_validation_payload(wire)?;
+            ensure_empty_generic_execution_fields(wire, false)?;
+            let payload = wire
+                .validation
+                .clone()
+                .ok_or_else(|| "validation operation requires validation payload".to_string())?;
+            validate_bridge_request(&payload)?;
+            Ok(RunnerOperation::Validation {
+                payload,
+                timeout_secs: wire.timeout_secs,
+            })
+        }
+        crate::lsp_bridge::AGENT_LSP_REQUEST_KIND => {
+            ensure_only_lsp_payload(wire)?;
+            ensure_empty_generic_execution_fields(wire, false)?;
+            Ok(RunnerOperation::Lsp {
+                payload: wire
+                    .lsp
+                    .clone()
+                    .ok_or_else(|| "lsp operation requires lsp payload".to_string())?,
+                timeout_secs: wire.timeout_secs,
+            })
+        }
+        "persistent_shell" => {
+            ensure_only_persistent_shell_payload(wire)?;
+            ensure_no_file_fields(wire)?;
+            if wire.job_id.is_some() || wire.stdin.is_some() {
+                return Err("persistent_shell contains incompatible execution fields".to_string());
+            }
+            let request = wire
+                .persistent_shell
+                .clone()
+                .ok_or_else(|| "persistent_shell requires persistent_shell payload".to_string())?;
+            validate_persistent_shell(&request)?;
+            if wire.cwd != request.cwd
+                || wire.command != request.command.clone().unwrap_or_default()
+                || wire.timeout_secs != request.timeout_secs.unwrap_or(30)
+            {
+                return Err(
+                    "persistent_shell compatibility fields do not match typed payload".to_string(),
+                );
+            }
+            Ok(RunnerOperation::PersistentShell(
+                RunnerPersistentShellOperation {
+                    request,
+                    job_context: wire.job_context.clone(),
+                },
+            ))
+        }
+        "mcp_gateway" => {
+            ensure_only_mcp_payload(wire)?;
+            ensure_empty_generic_execution_fields(wire, false)?;
+            let operation = wire
+                .mcp_gateway
+                .clone()
+                .ok_or_else(|| "mcp_gateway requires mcp_gateway payload".to_string())?;
+            validate_mcp_gateway_request(&operation)
+                .map_err(|error| format!("invalid MCP gateway request: {error}"))?;
+            Ok(RunnerOperation::McpGateway(operation))
+        }
+        "plugin_gateway" => {
+            ensure_only_plugin_payload(wire)?;
+            ensure_empty_generic_execution_fields(wire, false)?;
+            let operation = wire
+                .plugin_gateway
+                .clone()
+                .ok_or_else(|| "plugin_gateway requires plugin_gateway payload".to_string())?;
+            validate_plugin_gateway_request(&operation)
+                .map_err(|error| format!("invalid Plugin gateway request: {error}"))?;
+            Ok(RunnerOperation::PluginGateway(operation))
+        }
+        "coding_agent" => {
+            ensure_only_coding_agent_payload(wire)?;
+            ensure_empty_generic_execution_fields(wire, false)?;
+            let operation = wire
+                .coding_agent
+                .clone()
+                .ok_or_else(|| "coding_agent requires coding_agent payload".to_string())?;
+            validate_coding_agent_request(&operation)
+                .map_err(|error| format!("invalid CodingAgent request: {error}"))?;
+            Ok(RunnerOperation::CodingAgent(operation))
+        }
+        RUNNER_SKILL_REQUEST_KIND => {
+            ensure_special_payloads_absent(wire)?;
+            ensure_empty_generic_execution_fields(wire, true)?;
+            let content = bounded_content(
+                wire,
+                RUNNER_SKILL_REQUEST_MAX_BYTES,
+                RUNNER_SKILL_REQUEST_KIND,
+            )?;
+            let operation = serde_json::from_str::<RunnerSkillRequest>(content)
+                .map_err(|error| format!("invalid Runner Skill payload: {error}"))?;
+            operation
+                .validate()
+                .map_err(|error| format!("invalid Runner Skill request: {error}"))?;
+            Ok(RunnerOperation::Skill(operation))
+        }
+        "ssh_resource" => {
+            ensure_special_payloads_absent(wire)?;
+            ensure_empty_generic_execution_fields(wire, true)?;
+            let content = bounded_content(wire, SSH_RESOURCE_REQUEST_MAX_BYTES, "ssh_resource")?;
+            let operation = serde_json::from_str::<SshResourceRequest>(content)
+                .map_err(|error| format!("invalid SSH resource payload: {error}"))?;
+            operation
+                .validate()
+                .map_err(|error| format!("invalid SSH resource request: {error}"))?;
+            Ok(RunnerOperation::SshResource(operation))
+        }
+        RUNNER_INSTRUCTION_REQUEST_KIND => {
+            ensure_special_payloads_absent(wire)?;
+            ensure_empty_generic_execution_fields(wire, true)?;
+            let content = bounded_content(
+                wire,
+                RUNNER_INSTRUCTION_REQUEST_MAX_BYTES,
+                RUNNER_INSTRUCTION_REQUEST_KIND,
+            )?;
+            let operation = serde_json::from_str::<RunnerInstructionRequest>(content)
+                .map_err(|error| format!("invalid Runner instruction payload: {error}"))?;
+            operation
+                .validate()
+                .map_err(|error| format!("invalid Runner instruction request: {error}"))?;
+            Ok(RunnerOperation::RunnerInstruction(operation))
+        }
+        RUNNER_CONFIG_REQUEST_KIND => {
+            ensure_special_payloads_absent(wire)?;
+            ensure_empty_generic_execution_fields(wire, true)?;
+            let content = bounded_content(wire, RUNNER_CONFIG_REQUEST_MAX_BYTES, "runner_config")?;
+            let operation = serde_json::from_str::<RunnerConfigOperationRequest>(content)
+                .map_err(|error| format!("invalid Runner config payload: {error}"))?;
+            operation
+                .validate()
+                .map_err(|error| format!("invalid Runner config request: {error}"))?;
+            Ok(RunnerOperation::RunnerConfig(operation))
+        }
+        kind => Err(format!("unknown Runner V2 request kind: {kind}")),
+    }
+}
+
+fn decode_job_operation(wire: &RunnerRequest) -> Result<RunnerJobOperation, String> {
+    if matches!(
+        wire.kind.as_str(),
+        "start_skill_resource_job" | "start_build_job" | "start_format_job"
+    ) {
+        ensure_no_file_fields_except_content(wire)?;
+    } else {
+        ensure_no_file_fields(wire)?;
+    }
+    let job_id = wire
+        .job_id
+        .clone()
+        .ok_or_else(|| format!("{} requires job_id", wire.kind))?;
+    if wire.kind == "stop_job" {
+        ensure_special_payloads_absent(wire)?;
+        if wire.cwd.is_some()
+            || wire.stdin.is_some()
+            || wire.job_context.is_some()
+            || !wire.command.is_empty()
+        {
+            return Err("stop_job contains incompatible execution fields".to_string());
+        }
+        return Ok(RunnerJobOperation::Stop { job_id });
+    }
+    let context = wire
+        .job_context
+        .clone()
+        .ok_or_else(|| format!("{} requires job_context", wire.kind))?;
+    validate_job_context_coherence(wire.cwd.as_deref(), &context)?;
+    match wire.kind.as_str() {
+        "start_job" => {
+            ensure_special_payloads_absent(wire)?;
+            if wire.stdin.is_some() {
+                return Err("start_job does not accept stdin".to_string());
+            }
+            validate_raw_shell_wire_command(&wire.command)?;
+            Ok(RunnerJobOperation::StartShell(RunnerJobShellOperation {
+                job_id,
+                cwd: wire.cwd.clone(),
+                command: wire.command.clone(),
+                shell: wire.shell,
+                login: wire.login,
+                timeout_secs: wire.timeout_secs,
+                context,
+            }))
+        }
+        "start_validation_job" => {
+            ensure_special_payloads_absent(wire)?;
+            if wire.stdin.is_some() {
+                return Err("start_validation_job does not accept stdin".to_string());
+            }
+            let steps = serde_json::from_str::<Vec<ShellJobValidationStep>>(&wire.command)
+                .map_err(|error| format!("invalid validation Job plan: {error}"))?;
+            validate_validation_steps(&steps, context.validation.as_ref())?;
+            let names = steps
+                .iter()
+                .map(|step| step.name.clone())
+                .collect::<Vec<_>>();
+            if context.validation_steps != names {
+                return Err("validation Job plan does not match recovery context".to_string());
+            }
+            Ok(RunnerJobOperation::StartValidation(
+                RunnerJobValidationOperation {
+                    job_id,
+                    cwd: wire.cwd.clone(),
+                    steps,
+                    timeout_secs: wire.timeout_secs,
+                    context,
+                },
+            ))
+        }
+        "start_format_job" => {
+            ensure_special_payloads_absent(wire)?;
+            if !wire.command.is_empty()
+                || wire.stdin.is_some()
+                || context.ssh_resource.is_some()
+                || context.validation.is_some()
+                || !context.validation_steps.is_empty()
+                || context.structured_execution
+                    != Some(crate::project_format::structured_metadata())
+            {
+                return Err("invalid project format Job context".into());
+            }
+            validate_structured_job_common(
+                wire.cwd.as_deref(),
+                None,
+                wire.timeout_secs,
+                crate::project_format::PROJECT_FORMAT_TIMEOUT_MAX_SECS,
+            )?;
+            let plan: crate::project_format::ProjectFormatPlan =
+                serde_json::from_str(bounded_content(
+                    wire,
+                    crate::project_format::PROJECT_FORMAT_PLAN_MAX_BYTES,
+                    "project format plan",
+                )?)
+                .map_err(|_| "invalid project format plan")?;
+            plan.digest().map_err(str::to_string)?;
+            Ok(RunnerJobOperation::StartFormat(RunnerJobFormatOperation {
+                job_id,
+                cwd: wire.cwd.clone(),
+                plan,
+                timeout_secs: wire.timeout_secs,
+                context,
+            }))
+        }
+        "start_build_job" => {
+            ensure_only_process_payload(wire)?;
+            if !wire.command.is_empty() || wire.stdin.is_some() || context.ssh_resource.is_some() {
+                return Err(
+                    "typed project build Job contains incompatible execution fields".to_string(),
+                );
+            }
+            let process = wire
+                .process
+                .clone()
+                .ok_or_else(|| "start_build_job requires process payload".to_string())?;
+            validate_process_argv(&process)?;
+            validate_structured_job_common(
+                wire.cwd.as_deref(),
+                None,
+                wire.timeout_secs,
+                PROCESS_TIMEOUT_MAX_SECS,
+            )?;
+            let provenance = serde_json::from_str::<crate::project_build::ProjectBuildProvenance>(
+                bounded_content(
+                    wire,
+                    crate::project_build::PROJECT_BUILD_PROVENANCE_MAX_BYTES,
+                    "project build provenance",
+                )?,
+            )
+            .map_err(|error| format!("invalid project build provenance: {error}"))?;
+            validate_project_build_job(&process, &provenance, &context)?;
+            let job = RunnerJobOperation::StartBuild(RunnerJobBuildOperation {
+                job_id,
+                cwd: wire.cwd.clone(),
+                process,
+                provenance,
+                timeout_secs: wire.timeout_secs,
+                context,
+            });
+            if job
+                .context()
+                .and_then(|ctx| ctx.structured_execution.clone())
+                != job.expected_structured_execution()
+            {
+                return Err(
+                    "project build Job recovery metadata does not match typed operation"
+                        .to_string(),
+                );
+            }
+            Ok(job)
+        }
+        "start_process_job" | "start_detached_process_job" | "start_interactive_process_job" => {
+            ensure_only_process_payload(wire)?;
+            if !wire.command.is_empty() || context.ssh_resource.is_some() {
+                return Err("typed process Job contains incompatible execution fields".to_string());
+            }
+            let process = wire
+                .process
+                .clone()
+                .ok_or_else(|| format!("{} requires process payload", wire.kind))?;
+            validate_process_argv(&process)?;
+            validate_structured_job_common(
+                wire.cwd.as_deref(),
+                wire.stdin.as_deref(),
+                wire.timeout_secs,
+                PROCESS_TIMEOUT_MAX_SECS,
+            )?;
+            let operation = RunnerJobProcessOperation {
+                job_id,
+                cwd: wire.cwd.clone(),
+                process,
+                stdin: wire.stdin.clone(),
+                timeout_secs: wire.timeout_secs,
+                context,
+            };
+            if wire.kind == "start_interactive_process_job" && operation.stdin.is_some() {
+                return Err("interactive_process_requires_job_write_input".into());
+            }
+            let job = if wire.kind == "start_detached_process_job" {
+                RunnerJobOperation::StartDetachedProcess(operation)
+            } else if wire.kind == "start_interactive_process_job" {
+                RunnerJobOperation::StartInteractiveProcess(operation)
+            } else {
+                RunnerJobOperation::StartProcess(operation)
+            };
+            if job
+                .context()
+                .and_then(|ctx| ctx.structured_execution.clone())
+                != job.expected_structured_execution()
+            {
+                return Err(
+                    "process Job recovery metadata does not match typed operation".to_string(),
+                );
+            }
+            Ok(job)
+        }
+        "start_script_job" => {
+            ensure_only_script_payload(wire)?;
+            if !wire.command.is_empty() || context.ssh_resource.is_some() {
+                return Err("typed script Job contains incompatible execution fields".to_string());
+            }
+            let script = wire
+                .script
+                .clone()
+                .ok_or_else(|| "start_script_job requires script payload".to_string())?;
+            validate_script_request(
+                &script,
+                wire.stdin.as_deref(),
+                wire.cwd.as_deref(),
+                wire.timeout_secs,
+            )?;
+            let job = RunnerJobOperation::StartScript(RunnerJobScriptOperation {
+                job_id,
+                cwd: wire.cwd.clone(),
+                script,
+                stdin: wire.stdin.clone(),
+                timeout_secs: wire.timeout_secs,
+                context,
+            });
+            if job
+                .context()
+                .and_then(|ctx| ctx.structured_execution.clone())
+                != job.expected_structured_execution()
+            {
+                return Err(
+                    "script Job recovery metadata does not match typed operation".to_string(),
+                );
+            }
+            Ok(job)
+        }
+        "start_skill_resource_job" => {
+            ensure_special_payloads_absent(wire)?;
+            if !wire.command.is_empty() || wire.stdin.is_some() || context.ssh_resource.is_some() {
+                return Err(
+                    "typed Skill resource Job contains incompatible execution fields".to_string(),
+                );
+            }
+            let content = bounded_content(
+                wire,
+                RUNNER_SKILL_EXECUTION_REQUEST_MAX_BYTES,
+                RUNNER_SKILL_EXECUTION_REQUEST_KIND,
+            )?;
+            let request = serde_json::from_str::<RunnerSkillExecutionRequest>(content)
+                .map_err(|error| format!("invalid Runner Skill execution payload: {error}"))?;
+            request
+                .validate()
+                .map_err(|error| format!("invalid Runner Skill execution request: {error}"))?;
+            validate_structured_job_common(
+                wire.cwd.as_deref(),
+                None,
+                wire.timeout_secs,
+                STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS,
+            )?;
+            let job = RunnerJobOperation::StartSkillResource(RunnerJobSkillResourceOperation {
+                job_id,
+                cwd: wire.cwd.clone(),
+                request,
+                timeout_secs: wire.timeout_secs,
+                context,
+            });
+            if job
+                .context()
+                .and_then(|ctx| ctx.structured_execution.clone())
+                != job.expected_structured_execution()
+            {
+                return Err(
+                    "Skill resource Job recovery metadata does not match typed operation"
+                        .to_string(),
+                );
+            }
+            Ok(job)
+        }
+        _ => unreachable!("decode_job_operation called for non-job kind"),
+    }
+}
+
+fn validate_project_build_job(
+    process: &ShellProcessArgv,
+    provenance: &crate::project_build::ProjectBuildProvenance,
+    context: &ShellJobContext,
+) -> Result<(), String> {
+    if !context.validation_steps.is_empty() || context.validation.is_some() {
+        return Err("project build Job cannot carry validation metadata".to_string());
+    }
+    if !provenance.is_valid() {
+        return Err("project build Job provenance is invalid".to_string());
+    }
+    let canonical = crate::project_build::canonical_project_build_process_with_manager(
+        &provenance.backend,
+        &provenance.request,
+        &process.executable,
+    )
+    .map_err(str::to_string)?;
+    if &canonical != process
+        || crate::project_build::project_build_invocation_digest(process)
+            != provenance.invocation_digest
+    {
+        return Err("project build Job process does not match build provenance".to_string());
+    }
+    Ok(())
+}
+
+fn validate_direct_process(operation: &RunnerProcessOperation) -> Result<(), String> {
+    validate_process_argv(&operation.process)?;
+    validate_direct_structured_common(
+        operation.cwd.as_deref(),
+        operation.stdin.as_deref(),
+        operation.timeout_secs,
+    )
+}
+
+fn validate_direct_script(operation: &RunnerScriptOperation, internal: bool) -> Result<(), String> {
+    validate_script_request(
+        &operation.script,
+        operation.stdin.as_deref(),
+        operation.cwd.as_deref(),
+        operation.timeout_secs,
+    )?;
+    if operation.timeout_secs > STRUCTURED_EXECUTION_DIRECT_SYNC_TIMEOUT_MAX_SECS {
+        return Err(format!(
+            "timeout_secs must be between 1 and {STRUCTURED_EXECUTION_DIRECT_SYNC_TIMEOUT_MAX_SECS}"
+        ));
+    }
+    if internal
+        && (operation.stdin.is_some()
+            || operation.script.language != ShellScriptLanguage::Sh
+            || !operation.script.args.is_empty())
+    {
+        return Err("internal POSIX script requires sh, no args, and no stdin".to_string());
+    }
+    Ok(())
+}
+
+fn validate_direct_structured_common(
+    cwd: Option<&str>,
+    stdin: Option<&str>,
+    timeout_secs: u64,
+) -> Result<(), String> {
+    validate_structured_text_fields(cwd, stdin)?;
+    if timeout_secs == 0 || timeout_secs > STRUCTURED_EXECUTION_DIRECT_SYNC_TIMEOUT_MAX_SECS {
+        return Err(format!(
+            "timeout_secs must be between 1 and {STRUCTURED_EXECUTION_DIRECT_SYNC_TIMEOUT_MAX_SECS}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_structured_job_common(
+    cwd: Option<&str>,
+    stdin: Option<&str>,
+    timeout_secs: u64,
+    timeout_max_secs: u64,
+) -> Result<(), String> {
+    validate_structured_text_fields(cwd, stdin)?;
+    if !(STRUCTURED_EXECUTION_TIMEOUT_MIN_SECS..=timeout_max_secs).contains(&timeout_secs) {
+        return Err(format!(
+            "timeout_secs must be between {STRUCTURED_EXECUTION_TIMEOUT_MIN_SECS} and {timeout_max_secs}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_structured_text_fields(cwd: Option<&str>, stdin: Option<&str>) -> Result<(), String> {
+    if let Some(stdin) = stdin {
+        if stdin.len() > PROCESS_STDIN_MAX_BYTES || stdin.contains('\0') {
+            return Err("stdin is invalid or oversized".to_string());
+        }
+    }
+    if let Some(cwd) = cwd {
+        if cwd.len() > PROCESS_CWD_MAX_BYTES || cwd.contains('\0') {
+            return Err("cwd is invalid or oversized".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_validation_steps(
+    steps: &[ShellJobValidationStep],
+    metadata: Option<&crate::runner_protocol::ShellJobValidationMetadata>,
+) -> Result<(), String> {
+    let project_all_packages = metadata.is_some_and(|metadata| {
+        metadata.tool == "project_validate"
+            && metadata.steps.as_slice() == steps
+            && metadata.is_valid()
+            && metadata
+                .project_validation
+                .as_ref()
+                .is_some_and(|provenance| {
+                    provenance.backend == "rust"
+                        && provenance.request.scope.as_ref().is_some_and(
+                            crate::project_validation::ProjectValidationScope::selects_all_packages,
+                        )
+                })
+    });
+    if !(1..=3).contains(&steps.len())
+        || steps.iter().any(|step| {
+            if project_all_packages {
+                !step.is_canonical_project_step()
+            } else {
+                !step.is_canonical()
+            }
+        })
+        || steps.iter().enumerate().any(|(index, step)| {
+            steps[..index]
+                .iter()
+                .any(|earlier| earlier.name == step.name)
+        })
+    {
+        return Err("invalid structured validation plan".to_string());
+    }
+    Ok(())
+}
+
+fn validate_job_context_coherence(
+    cwd: Option<&str>,
+    context: &ShellJobContext,
+) -> Result<(), String> {
+    if context.cwd.as_deref() != cwd {
+        return Err("job recovery context cwd does not match operation cwd".to_string());
+    }
+    if context.ssh_resource.is_some() && context.workflow_session_id.is_none() {
+        return Err("job recovery SSH resource requires Workflow Session".to_string());
+    }
+    Ok(())
+}
+
+fn validate_file_payload(kind: &str, payload: &RunnerFilePayload) -> Result<(), String> {
+    if payload.path.is_empty() || payload.path.contains('\0') {
+        return Err("file operation path is required and cannot contain NUL".to_string());
+    }
+    if payload.cwd.as_deref().is_some_and(|cwd| cwd.contains('\0')) {
+        return Err("file operation cwd cannot contain NUL".to_string());
+    }
+    if kind == "file_list_page" {
+        let raw = payload
+            .content
+            .as_deref()
+            .filter(|raw| raw.len() <= 256)
+            .ok_or("directory page request missing or oversized")?;
+        serde_json::from_str::<crate::directory_page::DirectoryPageRequest>(raw)
+            .map_err(|_| "invalid directory page request")?
+            .validate()?;
+        if payload.max_bytes.is_some() {
+            return Err("directory page does not accept max_bytes".into());
+        }
+    }
+    let write = kind == "file_write";
+    if !write
+        && (payload.expected_sha256.is_some()
+            || payload.expected_prefix.is_some()
+            || payload.create_dirs)
+    {
+        return Err(
+            "write-only compatibility fields are present on non-write file operation".to_string(),
+        );
+    }
+    if write && payload.content.is_none() {
+        return Err("file_write requires content".to_string());
+    }
+    if kind == "file_read" {
+        match (payload.start_line, payload.end_line) {
+            (Some(start), Some(end)) if start > 0 && end >= start => {}
+            _ => return Err("file_read line range is invalid".to_string()),
+        }
+    } else if payload.start_line.is_some() || payload.end_line.is_some() {
+        // skill_read_file historically uses both fields.
+        if kind != "file_skill_read_file"
+            || payload.start_line.is_none()
+            || payload.end_line.is_none()
+            || payload.start_line == Some(0)
+            || payload
+                .end_line
+                .zip(payload.start_line)
+                .is_some_and(|(end, start)| end < start)
+        {
+            return Err("line range is incompatible with file operation".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_json_payload(payload: &str, label: &str) -> Result<(), String> {
+    if payload.contains('\0') {
+        return Err(format!("{label} payload cannot contain NUL"));
+    }
+    serde_json::from_str::<serde_json::Value>(payload)
+        .map(|_| ())
+        .map_err(|error| format!("{label} payload is not valid JSON: {error}"))
+}
+
+fn validate_computer_payload(
+    kind: RunnerComputerOperationKind,
+    payload: &str,
+) -> Result<(), String> {
+    if payload.len() > shell_computer_request_payload_max_bytes(kind.wire_kind()) {
+        return Err("computer request payload exceeds V2 bound".to_string());
+    }
+    validate_json_payload(payload, "computer operation")
+}
+
+fn validate_browser_payload(kind: RunnerBrowserOperationKind, payload: &str) -> Result<(), String> {
+    if payload.len() > kind.max_payload_bytes() {
+        return Err("browser request payload exceeds V2 bound".to_string());
+    }
+    validate_json_payload(payload, "browser operation")
+}
+
+fn validate_persistent_shell(request: &PersistentShellRequest) -> Result<(), String> {
+    if !matches!(
+        request.action.as_str(),
+        "open" | "exec" | "status" | "close"
+    ) {
+        return Err("unsupported persistent shell action".to_string());
+    }
+    if request.shell_id.is_empty()
+        || request.workflow_session_id.is_empty()
+        || request.runtime_project_id.trim().is_empty()
+        || request
+            .command
+            .as_deref()
+            .is_some_and(|command| command.contains('\0'))
+    {
+        return Err("persistent shell payload is invalid".to_string());
+    }
+    Ok(())
+}
+
+fn bounded_content<'a>(
+    wire: &'a RunnerRequest,
+    max_bytes: usize,
+    label: &str,
+) -> Result<&'a str, String> {
+    let content = wire
+        .content
+        .as_deref()
+        .ok_or_else(|| format!("{label} requires content payload"))?;
+    if content.len() > max_bytes || content.contains('\0') {
+        return Err(format!("{label} content payload is invalid or oversized"));
+    }
+    Ok(content)
+}
+
+fn ensure_no_file_fields_except_content(wire: &RunnerRequest) -> Result<(), String> {
+    if wire.path.is_some()
+        || wire.max_bytes.is_some()
+        || wire.expected_sha256.is_some()
+        || wire.expected_prefix.is_some()
+        || wire.start_line.is_some()
+        || wire.end_line.is_some()
+        || wire.create_dirs
+    {
+        return Err(format!("{} contains incompatible file fields", wire.kind));
+    }
+    Ok(())
+}
+
+fn ensure_no_file_fields(wire: &RunnerRequest) -> Result<(), String> {
+    if wire.path.is_some()
+        || wire.content.is_some()
+        || wire.max_bytes.is_some()
+        || wire.expected_sha256.is_some()
+        || wire.expected_prefix.is_some()
+        || wire.start_line.is_some()
+        || wire.end_line.is_some()
+        || wire.create_dirs
+    {
+        return Err(format!("{} contains incompatible file fields", wire.kind));
+    }
+    Ok(())
+}
+
+fn ensure_no_file_fields_except_max_bytes(wire: &RunnerRequest) -> Result<(), String> {
+    if wire.path.is_some()
+        || wire.content.is_some()
+        || wire.expected_sha256.is_some()
+        || wire.expected_prefix.is_some()
+        || wire.start_line.is_some()
+        || wire.end_line.is_some()
+        || wire.create_dirs
+    {
+        return Err(format!("{} contains incompatible file fields", wire.kind));
+    }
+    Ok(())
+}
+
+fn ensure_special_payloads_absent(wire: &RunnerRequest) -> Result<(), String> {
+    if wire.process.is_some()
+        || wire.script.is_some()
+        || wire.validation.is_some()
+        || wire.lsp.is_some()
+        || wire.persistent_shell.is_some()
+        || wire.mcp_gateway.is_some()
+        || wire.plugin_gateway.is_some()
+        || wire.coding_agent.is_some()
+    {
+        return Err(format!("{} contains incompatible typed payload", wire.kind));
+    }
+    Ok(())
+}
+
+fn ensure_only_process_payload(wire: &RunnerRequest) -> Result<(), String> {
+    if wire.script.is_some()
+        || wire.validation.is_some()
+        || wire.lsp.is_some()
+        || wire.persistent_shell.is_some()
+        || wire.mcp_gateway.is_some()
+        || wire.plugin_gateway.is_some()
+        || wire.coding_agent.is_some()
+    {
+        return Err(format!(
+            "{} conflicts with non-process typed payload",
+            wire.kind
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_only_script_payload(wire: &RunnerRequest) -> Result<(), String> {
+    if wire.process.is_some()
+        || wire.validation.is_some()
+        || wire.lsp.is_some()
+        || wire.persistent_shell.is_some()
+        || wire.mcp_gateway.is_some()
+        || wire.plugin_gateway.is_some()
+        || wire.coding_agent.is_some()
+    {
+        return Err(format!(
+            "{} conflicts with non-script typed payload",
+            wire.kind
+        ));
+    }
+    Ok(())
+}
+
+macro_rules! ensure_only_payload {
+    ($name:ident, $allowed:ident) => {
+        fn $name(wire: &RunnerRequest) -> Result<(), String> {
+            if wire.process.is_some()
+                || wire.script.is_some()
+                || wire.validation.is_some() && stringify!($allowed) != "validation"
+                || wire.lsp.is_some() && stringify!($allowed) != "lsp"
+                || wire.persistent_shell.is_some() && stringify!($allowed) != "persistent_shell"
+                || wire.mcp_gateway.is_some() && stringify!($allowed) != "mcp_gateway"
+                || wire.plugin_gateway.is_some() && stringify!($allowed) != "plugin_gateway"
+                || wire.coding_agent.is_some() && stringify!($allowed) != "coding_agent"
+            {
+                return Err(format!("{} contains conflicting typed payloads", wire.kind));
+            }
+            Ok(())
+        }
+    };
+}
+
+ensure_only_payload!(ensure_only_validation_payload, validation);
+ensure_only_payload!(ensure_only_lsp_payload, lsp);
+ensure_only_payload!(ensure_only_persistent_shell_payload, persistent_shell);
+ensure_only_payload!(ensure_only_mcp_payload, mcp_gateway);
+ensure_only_payload!(ensure_only_plugin_payload, plugin_gateway);
+ensure_only_payload!(ensure_only_coding_agent_payload, coding_agent);
+
+fn ensure_empty_generic_execution_fields(
+    wire: &RunnerRequest,
+    allow_content: bool,
+) -> Result<(), String> {
+    if wire.job_id.is_some()
+        || wire.cwd.is_some()
+        || wire.path.is_some()
+        || (!allow_content && wire.content.is_some())
+        || wire.max_bytes.is_some()
+        || wire.expected_sha256.is_some()
+        || wire.expected_prefix.is_some()
+        || wire.start_line.is_some()
+        || wire.end_line.is_some()
+        || wire.create_dirs
+        || !wire.command.is_empty()
+        || wire.shell.is_some()
+        || wire.stdin.is_some()
+        || wire.job_context.is_some()
+    {
+        return Err(format!(
+            "{} contains incompatible generic fields",
+            wire.kind
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn metadata() -> RunnerInvocationMetadata {
+        RunnerInvocationMetadata {
+            request_id: "req-1".to_string(),
+            client_id: "runner-1".to_string(),
+            requested_by: "tester".to_string(),
+            created_at: 123,
+        }
+    }
+
+    fn shell_wire() -> RunnerRequest {
+        RunnerRequest::from_operation(
+            metadata(),
+            RunnerOperation::RunShell(RunnerShellOperation {
+                login: false,
+                cwd: Some("/tmp".to_string()),
+                command: "printf ok".to_string(),
+                shell: None,
+                stdin: None,
+                max_bytes: None,
+                timeout_secs: 30,
+                job_context: None,
+            }),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn bash_login_wire_is_explicit_and_shell_bound() {
+        let mut wire = shell_wire();
+        wire.shell = Some(crate::workflow_session_contract::ExecutionShell::Bash);
+        wire.login = true;
+        let RunnerOperation::RunShell(decoded) = wire.decode_operation().unwrap() else {
+            panic!("expected shell operation");
+        };
+        assert!(decoded.login);
+        assert_eq!(
+            decoded.shell,
+            Some(crate::workflow_session_contract::ExecutionShell::Bash)
+        );
+        wire.shell = Some(crate::workflow_session_contract::ExecutionShell::Sh);
+        assert!(wire
+            .decode_operation()
+            .unwrap_err()
+            .contains("bash login mode"));
+        wire.kind = "run_process".to_string();
+        assert!(wire.decode_operation().is_err());
+    }
+
+    #[test]
+    fn raw_shell_selector_round_trips_on_dedicated_wire_field() {
+        let wire = RunnerRequest::from_operation(
+            metadata(),
+            RunnerOperation::RunShell(RunnerShellOperation {
+                login: false,
+                cwd: None,
+                command: "printf ok".to_string(),
+                shell: Some(crate::workflow_session_contract::ExecutionShell::Bash),
+                stdin: None,
+                max_bytes: None,
+                timeout_secs: 30,
+                job_context: None,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            wire.shell,
+            Some(crate::workflow_session_contract::ExecutionShell::Bash)
+        );
+        let RunnerOperation::RunShell(decoded) = wire.decode_operation().unwrap() else {
+            panic!("expected run_shell")
+        };
+        assert_eq!(
+            decoded.shell,
+            Some(crate::workflow_session_contract::ExecutionShell::Bash)
+        );
+
+        let mut invalid = wire;
+        invalid.kind = "run_process".to_string();
+        assert!(invalid
+            .decode_operation()
+            .unwrap_err()
+            .contains("does not accept the raw-shell selector"));
+    }
+
+    fn job_context(cwd: Option<&str>) -> ShellJobContext {
+        ShellJobContext {
+            runtime_project_id: None,
+            workflow_session_id: None,
+            ssh_resource: None,
+            project_cwd: None,
+            cwd: cwd.map(str::to_string),
+            purpose: Some("operation".to_string()),
+            shell: Some("configured".to_string()),
+            command_preview: "typed operation".to_string(),
+            validation_steps: Vec::new(),
+            validation: None,
+            structured_execution: None,
+        }
+    }
+
+    fn structured_job_context(
+        cwd: Option<&str>,
+        execution_source: &str,
+        language: Option<ShellScriptLanguage>,
+        script_bytes: Option<usize>,
+        arg_count: usize,
+        stdin_present: bool,
+    ) -> ShellJobContext {
+        let mut context = job_context(cwd);
+        context.shell = Some("direct_argv".to_string());
+        context.structured_execution = Some(ShellJobStructuredExecutionMetadata {
+            execution_source: execution_source.to_string(),
+            language,
+            script_bytes,
+            arg_count,
+            stdin_present,
+            validation_identity: None,
+            validation_tool: None,
+            assertion_name: None,
+        });
+        context
+    }
+
+    fn round_trip_kind(operation: RunnerOperation) -> RunnerRequest {
+        let expected_kind = operation.wire_kind();
+        let wire = RunnerRequest::from_operation(metadata(), operation)
+            .unwrap_or_else(|error| panic!("encode {expected_kind}: {error}"));
+        assert_eq!(wire.kind, expected_kind);
+        let decoded = wire
+            .decode_operation()
+            .unwrap_or_else(|error| panic!("decode {expected_kind}: {error}"));
+        assert_eq!(decoded.wire_kind(), expected_kind);
+        wire
+    }
+
+    fn file_payload(content: Option<&str>) -> RunnerFilePayload {
+        RunnerFilePayload {
+            cwd: Some("/repo".to_string()),
+            path: "path.txt".to_string(),
+            content: content.map(str::to_string),
+            max_bytes: None,
+            expected_sha256: None,
+            expected_prefix: None,
+            start_line: None,
+            end_line: None,
+            create_dirs: false,
+        }
+    }
+
+    fn skill_execution_request() -> RunnerSkillExecutionRequest {
+        RunnerSkillExecutionRequest {
+            skill_id: "wc_skill_qqqqqqqqqqqqqqqqqqqqqg".to_string(),
+            expected_source: crate::runner_skill::RunnerSkillSource::Configured,
+            path: "scripts/probe.py".to_string(),
+            expected_definition_revision: "b".repeat(64),
+            expected_package_revision: None,
+            expected_resource_sha256: "c".repeat(64),
+            args: vec!["literal".to_string()],
+        }
+    }
+
+    #[test]
+    fn skill_resource_structured_execution_metadata_is_valid() {
+        let request = skill_execution_request();
+        let operation = RunnerJobOperation::StartSkillResource(RunnerJobSkillResourceOperation {
+            job_id: "job-skill-resource-metadata".to_string(),
+            cwd: Some("/repo".to_string()),
+            request: request.clone(),
+            timeout_secs: 60,
+            context: structured_job_context(
+                Some("/repo"),
+                "run_skill_resource",
+                None,
+                None,
+                request.args.len(),
+                true,
+            ),
+        });
+        let metadata = operation
+            .expected_structured_execution()
+            .expect("Skill resource jobs retain structured execution metadata");
+        assert_eq!(metadata.execution_source, "run_skill_resource");
+        assert!(metadata.is_valid());
+    }
+
+    #[test]
+    fn omitted_v2_kind_keeps_legacy_run_shell_default() {
+        let value = serde_json::json!({
+            "request_id": "req-1",
+            "client_id": "runner-1",
+            "command": "printf ok",
+            "timeout_secs": 30,
+            "requested_by": "tester",
+            "created_at": 123
+        });
+        let wire: RunnerRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(wire.kind, "run_shell");
+        assert!(matches!(
+            wire.decode_operation().unwrap(),
+            RunnerOperation::RunShell(_)
+        ));
+    }
+
+    #[test]
+    fn explicit_unknown_kind_fails_closed() {
+        let mut wire = shell_wire();
+        wire.kind = "future_magic_operation".to_string();
+        assert!(wire
+            .decode_operation()
+            .unwrap_err()
+            .contains("unknown Runner V2 request kind"));
+    }
+
+    #[test]
+    fn conflicting_process_and_script_payloads_fail_closed() {
+        let process = RunnerProcessOperation {
+            cwd: None,
+            process: ShellProcessArgv {
+                executable: "printf".to_string(),
+                args: vec!["ok".to_string()],
+            },
+            stdin: None,
+            timeout_secs: 30,
+        };
+        let mut wire =
+            RunnerRequest::from_operation(metadata(), RunnerOperation::RunProcess(process))
+                .unwrap();
+        wire.script = Some(ShellScriptPayload {
+            language: ShellScriptLanguage::Sh,
+            script: "printf no".to_string(),
+            args: Vec::new(),
+        });
+        assert!(wire.decode_operation().unwrap_err().contains("conflicts"));
+    }
+
+    #[test]
+    fn durable_long_process_script_jobs_round_trip_while_direct_and_skill_limits_stay_bounded() {
+        let process = ShellProcessArgv {
+            executable: "printf".to_string(),
+            args: vec!["ok".to_string()],
+        };
+        for (operation, expected_kind) in [
+            (
+                RunnerOperation::Job(RunnerJobOperation::StartProcess(
+                    RunnerJobProcessOperation {
+                        job_id: "job-long-process".to_string(),
+                        cwd: Some("/repo".to_string()),
+                        process: process.clone(),
+                        stdin: None,
+                        timeout_secs: 21_600,
+                        context: structured_job_context(
+                            Some("/repo"),
+                            "run_process",
+                            None,
+                            None,
+                            1,
+                            false,
+                        ),
+                    },
+                )),
+                "start_process_job",
+            ),
+            (
+                RunnerOperation::Job(RunnerJobOperation::StartDetachedProcess(
+                    RunnerJobProcessOperation {
+                        job_id: "job-long-detached".to_string(),
+                        cwd: Some("/repo".to_string()),
+                        process: process.clone(),
+                        stdin: None,
+                        timeout_secs: 21_600,
+                        context: structured_job_context(
+                            Some("/repo"),
+                            "run_detached_process",
+                            None,
+                            None,
+                            1,
+                            false,
+                        ),
+                    },
+                )),
+                "start_detached_process_job",
+            ),
+        ] {
+            let wire = round_trip_kind(operation);
+            assert_eq!(wire.kind, expected_kind);
+            assert_eq!(wire.timeout_secs, 21_600);
+        }
+
+        let script = ShellScriptPayload {
+            language: ShellScriptLanguage::Sh,
+            script: "printf ok".to_string(),
+            args: Vec::new(),
+        };
+        let script_wire = round_trip_kind(RunnerOperation::Job(RunnerJobOperation::StartScript(
+            RunnerJobScriptOperation {
+                job_id: "job-long-script".to_string(),
+                cwd: Some("/repo".to_string()),
+                script: script.clone(),
+                stdin: None,
+                timeout_secs: 21_600,
+                context: structured_job_context(
+                    Some("/repo"),
+                    "run_script",
+                    Some(ShellScriptLanguage::Sh),
+                    Some(script.script.len()),
+                    0,
+                    false,
+                ),
+            },
+        )));
+        assert_eq!(script_wire.timeout_secs, 21_600);
+
+        let oversized_process = RunnerOperation::Job(RunnerJobOperation::StartProcess(
+            RunnerJobProcessOperation {
+                job_id: "job-too-long".to_string(),
+                cwd: None,
+                process: process.clone(),
+                stdin: None,
+                timeout_secs: PROCESS_TIMEOUT_MAX_SECS + 1,
+                context: structured_job_context(None, "run_process", None, None, 1, false),
+            },
+        ));
+        assert!(RunnerRequest::from_operation(metadata(), oversized_process)
+            .unwrap_err()
+            .contains(&PROCESS_TIMEOUT_MAX_SECS.to_string()));
+
+        let direct_process = RunnerOperation::RunProcess(RunnerProcessOperation {
+            cwd: None,
+            process,
+            stdin: None,
+            timeout_secs: STRUCTURED_EXECUTION_DIRECT_SYNC_TIMEOUT_MAX_SECS + 1,
+        });
+        assert!(RunnerRequest::from_operation(metadata(), direct_process)
+            .unwrap_err()
+            .contains(&STRUCTURED_EXECUTION_DIRECT_SYNC_TIMEOUT_MAX_SECS.to_string()));
+
+        let direct_script = RunnerOperation::RunScript(RunnerScriptOperation {
+            cwd: None,
+            script,
+            stdin: None,
+            timeout_secs: STRUCTURED_EXECUTION_DIRECT_SYNC_TIMEOUT_MAX_SECS + 1,
+        });
+        assert!(RunnerRequest::from_operation(metadata(), direct_script)
+            .unwrap_err()
+            .contains(&STRUCTURED_EXECUTION_DIRECT_SYNC_TIMEOUT_MAX_SECS.to_string()));
+
+        let skill_request = skill_execution_request();
+        let skill_job = RunnerOperation::Job(RunnerJobOperation::StartSkillResource(
+            RunnerJobSkillResourceOperation {
+                job_id: "job-long-skill".to_string(),
+                cwd: None,
+                request: skill_request.clone(),
+                timeout_secs: STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS + 1,
+                context: structured_job_context(
+                    None,
+                    "run_skill_resource",
+                    None,
+                    None,
+                    skill_request.args.len(),
+                    true,
+                ),
+            },
+        ));
+        assert!(RunnerRequest::from_operation(metadata(), skill_job)
+            .unwrap_err()
+            .contains(&STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS.to_string()));
+    }
+
+    #[test]
+    fn canonical_process_round_trip_has_no_shell_or_script_payload() {
+        let operation = RunnerOperation::RunProcess(RunnerProcessOperation {
+            cwd: Some("subdir".to_string()),
+            process: ShellProcessArgv {
+                executable: "argv-helper".to_string(),
+                args: vec!["literal space".to_string()],
+            },
+            stdin: Some("input".to_string()),
+            timeout_secs: 60,
+        });
+        let wire = RunnerRequest::from_operation(metadata(), operation).unwrap();
+        assert_eq!(wire.kind, "run_process");
+        assert!(wire.command.is_empty());
+        assert!(wire.script.is_none());
+        assert!(wire.process.is_some());
+        assert!(matches!(
+            wire.decode_operation().unwrap(),
+            RunnerOperation::RunProcess(_)
+        ));
+    }
+
+    #[test]
+    fn lsp_wire_rejects_generic_execution_baggage() {
+        let operation = RunnerOperation::Lsp {
+            payload: RunnerLspPayload {
+                project_id: "demo".to_string(),
+                request: crate::lsp_bridge::RunnerLspRequest::Status,
+            },
+            timeout_secs: 30,
+        };
+        let canonical = RunnerRequest::from_operation(metadata(), operation).unwrap();
+        assert_eq!(canonical.kind, crate::lsp_bridge::AGENT_LSP_REQUEST_KIND);
+        assert!(canonical.cwd.is_none());
+        assert!(canonical.command.is_empty());
+        assert!(matches!(
+            canonical.decode_operation().unwrap(),
+            RunnerOperation::Lsp { .. }
+        ));
+
+        let mut with_cwd = canonical.clone();
+        with_cwd.cwd = Some("/historical/ignored/cwd".to_string());
+        assert!(with_cwd
+            .decode_operation()
+            .unwrap_err()
+            .contains("incompatible generic fields"));
+
+        let mut with_command = canonical.clone();
+        with_command.command = "printf must-not-run".to_string();
+        assert!(with_command
+            .decode_operation()
+            .unwrap_err()
+            .contains("incompatible generic fields"));
+
+        let mut with_process = canonical;
+        with_process.process = Some(ShellProcessArgv {
+            executable: "printf".to_string(),
+            args: vec!["conflict".to_string()],
+        });
+        assert!(with_process
+            .decode_operation()
+            .unwrap_err()
+            .contains("conflicting"));
+    }
+
+    #[test]
+    fn canonical_file_and_project_operations_round_trip() {
+        let file = RunnerFileOperation::Read(RunnerFilePayload {
+            cwd: Some("/repo".to_string()),
+            path: "src/lib.rs".to_string(),
+            content: None,
+            max_bytes: Some(4096),
+            expected_sha256: None,
+            expected_prefix: None,
+            start_line: Some(1),
+            end_line: Some(20),
+            create_dirs: false,
+        });
+        let wire = RunnerRequest::from_operation(metadata(), RunnerOperation::File(file)).unwrap();
+        assert_eq!(wire.kind, "file_read");
+        assert!(matches!(
+            wire.decode_operation().unwrap(),
+            RunnerOperation::File(RunnerFileOperation::Read(_))
+        ));
+
+        let project = RunnerProjectOperation {
+            kind: RunnerProjectOperationKind::Register,
+            payload: "{\"path\":\"/repo\"}".to_string(),
+        };
+        let wire =
+            RunnerRequest::from_operation(metadata(), RunnerOperation::Project(project)).unwrap();
+        assert_eq!(wire.kind, "register_project");
+        assert!(wire.command.is_empty());
+        assert!(matches!(
+            wire.decode_operation().unwrap(),
+            RunnerOperation::Project(_)
+        ));
+    }
+
+    #[test]
+    fn project_all_packages_validation_wire_roundtrip_requires_matching_provenance() {
+        use crate::project_validation::{
+            ProjectValidationAction, ProjectValidationAdapter, ProjectValidationProvenance,
+            ProjectValidationRequest, ProjectValidationScope,
+        };
+        use crate::runner_protocol::ShellJobValidationMetadata;
+
+        for action in [
+            ProjectValidationAction::Check,
+            ProjectValidationAction::Test,
+        ] {
+            let kind = action.kind();
+            let args = if action == ProjectValidationAction::Check {
+                vec!["check".into(), "--all-targets".into(), "--workspace".into()]
+            } else {
+                vec!["test".into(), "--workspace".into()]
+            };
+            let step = ShellJobValidationStep {
+                name: kind.into(),
+                program: "cargo".into(),
+                args,
+                env: Vec::new(),
+            };
+            assert!(!step.is_canonical());
+            let provenance = ProjectValidationProvenance {
+                request: ProjectValidationRequest {
+                    project_id: "demo".into(),
+                    cwd: None,
+                    action,
+                    adapter: ProjectValidationAdapter::Rust,
+                    scope: Some(ProjectValidationScope {
+                        packages: Vec::new(),
+                        all_packages: true,
+                    }),
+                    dependency_policy: None,
+                    test: None,
+                },
+                backend: "rust".into(),
+                recipe_root: ".".into(),
+                root_digest: "a".repeat(64),
+                manifest_digest: "b".repeat(64),
+                invocation_digest: "c".repeat(64),
+            };
+            let (require_tests, minimum_tests) = provenance.request.test_requirements();
+            let mut context = job_context(Some("/repo"));
+            context.validation_steps = vec![kind.into()];
+            context.validation = Some(ShellJobValidationMetadata {
+                project_validation: Some(provenance),
+                tool: "project_validate".into(),
+                kind: kind.into(),
+                adapter: if action == ProjectValidationAction::Check {
+                    "cargo_check"
+                } else {
+                    "cargo_test"
+                }
+                .into(),
+                steps: vec![step.clone()],
+                effective_timeout_secs: 60,
+                sync_wait_secs: 10,
+                validation_target_id: None,
+                source_fence: None,
+                minimum_tests,
+                require_tests,
+                no_run: None,
+            });
+            assert!(context.validation.as_ref().unwrap().is_valid());
+            let operation = RunnerJobValidationOperation {
+                job_id: "all-packages-job".into(),
+                cwd: Some("/repo".into()),
+                steps: vec![step],
+                timeout_secs: 60,
+                context,
+            };
+            let wire = RunnerRequest::from_operation(
+                metadata(),
+                RunnerOperation::Job(RunnerJobOperation::StartValidation(operation.clone())),
+            )
+            .unwrap();
+            let RunnerOperation::Job(RunnerJobOperation::StartValidation(decoded)) =
+                wire.decode_operation().unwrap()
+            else {
+                panic!("expected validation job");
+            };
+            assert_eq!(decoded.steps, operation.steps);
+            assert_eq!(decoded.context.validation, operation.context.validation);
+
+            let mut naked = operation.clone();
+            naked.context.validation = None;
+            assert!(RunnerRequest::from_operation(
+                metadata(),
+                RunnerOperation::Job(RunnerJobOperation::StartValidation(naked))
+            )
+            .is_err());
+            for variant in 0..3 {
+                let mut invalid = wire.clone();
+                let metadata = invalid
+                    .job_context
+                    .as_mut()
+                    .unwrap()
+                    .validation
+                    .as_mut()
+                    .unwrap();
+                match variant {
+                    0 => metadata.project_validation = None,
+                    1 => metadata.project_validation.as_mut().unwrap().request.scope = None,
+                    _ => metadata.steps[0].args.retain(|arg| arg != "--workspace"),
+                }
+                assert!(
+                    invalid.decode_operation().is_err(),
+                    "accepted malformed provenance variant {variant}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_current_runner_operation_kind_round_trips_through_v2() {
+        use std::collections::BTreeSet;
+
+        let script = ShellScriptPayload {
+            language: ShellScriptLanguage::Sh,
+            script: "printf ok".to_string(),
+            args: vec!["literal".to_string()],
+        };
+        let skill_request = skill_execution_request();
+        let validation_step = ShellJobValidationStep {
+            name: "check".to_string(),
+            program: "cargo".to_string(),
+            args: vec!["check".to_string()],
+            env: Vec::new(),
+        };
+        let mut validation_context = job_context(Some("/repo"));
+        validation_context.validation_steps = vec!["check".to_string()];
+        let build_request = crate::project_build::ProjectBuildRequest {
+            project_id: "demo".to_string(),
+            cwd: None,
+            adapter: crate::project_build::ProjectBuildAdapter::Rust,
+            scope: None,
+            dependency_policy: None,
+        };
+        let build_process =
+            crate::project_build::canonical_project_build_process("rust", &build_request).unwrap();
+        let build_provenance = crate::project_build::ProjectBuildProvenance {
+            request: build_request,
+            backend: "rust".to_string(),
+            recipe_root: ".".to_string(),
+            root_digest: "1".repeat(64),
+            manifest_digest: "2".repeat(64),
+            invocation_digest: crate::project_build::project_build_invocation_digest(
+                &build_process,
+            ),
+        };
+        let mut operations = vec![
+            RunnerOperation::RunShell(RunnerShellOperation {
+                login: false,
+                cwd: Some("/repo".to_string()),
+                command: "printf ok".to_string(),
+                shell: None,
+                stdin: None,
+                max_bytes: None,
+                timeout_secs: 30,
+                job_context: None,
+            }),
+            RunnerOperation::RunProcess(RunnerProcessOperation {
+                cwd: Some("/repo".to_string()),
+                process: ShellProcessArgv {
+                    executable: "printf".to_string(),
+                    args: vec!["ok".to_string()],
+                },
+                stdin: Some("input".to_string()),
+                timeout_secs: 30,
+            }),
+            RunnerOperation::RunScript(RunnerScriptOperation {
+                cwd: Some("/repo".to_string()),
+                script: script.clone(),
+                stdin: None,
+                timeout_secs: 30,
+            }),
+            RunnerOperation::RunInternalPosixScript(RunnerScriptOperation {
+                cwd: Some("/repo".to_string()),
+                script: ShellScriptPayload {
+                    language: ShellScriptLanguage::Sh,
+                    script: "printf internal".to_string(),
+                    args: Vec::new(),
+                },
+                stdin: None,
+                timeout_secs: 30,
+            }),
+            RunnerOperation::RunSkillResource(RunnerSkillResourceOperation {
+                cwd: Some("/repo".to_string()),
+                request: skill_request.clone(),
+                timeout_secs: 30,
+            }),
+            RunnerOperation::Job(RunnerJobOperation::StartShell(RunnerJobShellOperation {
+                login: false,
+                job_id: "job-shell".to_string(),
+                cwd: Some("/repo".to_string()),
+                command: "printf job".to_string(),
+                shell: None,
+                timeout_secs: 60,
+                context: job_context(Some("/repo")),
+            })),
+            RunnerOperation::Job(RunnerJobOperation::StartValidation(
+                RunnerJobValidationOperation {
+                    job_id: "job-validation".to_string(),
+                    cwd: Some("/repo".to_string()),
+                    steps: vec![validation_step],
+                    timeout_secs: 60,
+                    context: validation_context,
+                },
+            )),
+            RunnerOperation::Job(RunnerJobOperation::StartBuild(RunnerJobBuildOperation {
+                job_id: "job-build".to_string(),
+                cwd: Some("/repo".to_string()),
+                process: build_process.clone(),
+                provenance: build_provenance,
+                timeout_secs: 60,
+                context: structured_job_context(
+                    Some("/repo"),
+                    "project_build",
+                    None,
+                    None,
+                    build_process.args.len(),
+                    false,
+                ),
+            })),
+            RunnerOperation::Job(RunnerJobOperation::StartProcess(
+                RunnerJobProcessOperation {
+                    job_id: "job-process".to_string(),
+                    cwd: Some("/repo".to_string()),
+                    process: ShellProcessArgv {
+                        executable: "process".to_string(),
+                        args: vec!["arg".to_string()],
+                    },
+                    stdin: None,
+                    timeout_secs: 60,
+                    context: structured_job_context(
+                        Some("/repo"),
+                        "run_process",
+                        None,
+                        None,
+                        1,
+                        false,
+                    ),
+                },
+            )),
+            RunnerOperation::Job(RunnerJobOperation::StartDetachedProcess(
+                RunnerJobProcessOperation {
+                    job_id: "job-detached".to_string(),
+                    cwd: Some("/repo".to_string()),
+                    process: ShellProcessArgv {
+                        executable: "process".to_string(),
+                        args: vec!["arg".to_string()],
+                    },
+                    stdin: None,
+                    timeout_secs: 60,
+                    context: structured_job_context(
+                        Some("/repo"),
+                        "run_detached_process",
+                        None,
+                        None,
+                        1,
+                        false,
+                    ),
+                },
+            )),
+            RunnerOperation::Job(RunnerJobOperation::StartScript(RunnerJobScriptOperation {
+                job_id: "job-script".to_string(),
+                cwd: Some("/repo".to_string()),
+                script: script.clone(),
+                stdin: None,
+                timeout_secs: 60,
+                context: structured_job_context(
+                    Some("/repo"),
+                    "run_script",
+                    Some(ShellScriptLanguage::Sh),
+                    Some(script.script.len()),
+                    script.args.len(),
+                    false,
+                ),
+            })),
+            RunnerOperation::Job(RunnerJobOperation::StartSkillResource(
+                RunnerJobSkillResourceOperation {
+                    job_id: "job-skill-resource".to_string(),
+                    cwd: Some("/repo".to_string()),
+                    request: skill_request.clone(),
+                    timeout_secs: 60,
+                    context: structured_job_context(
+                        Some("/repo"),
+                        "run_skill_resource",
+                        None,
+                        None,
+                        skill_request.args.len(),
+                        true,
+                    ),
+                },
+            )),
+            RunnerOperation::Job(RunnerJobOperation::Stop {
+                job_id: "job-stop".to_string(),
+            }),
+            RunnerOperation::Validation {
+                payload: ValidationBridgeRequest {
+                    protocol_version: crate::validation_bridge::VALIDATION_BRIDGE_PROTOCOL_VERSION,
+                    adapter_id: "pyright".to_string(),
+                    language: "python".to_string(),
+                    validation_kind: "typecheck".to_string(),
+                    project_id: "demo".to_string(),
+                    cwd: None,
+                    targets: Vec::new(),
+                    timeout_secs: 60,
+                },
+                timeout_secs: 60,
+            },
+            RunnerOperation::Lsp {
+                payload: RunnerLspPayload {
+                    project_id: "demo".to_string(),
+                    request: crate::lsp_bridge::RunnerLspRequest::Status,
+                },
+                timeout_secs: 30,
+            },
+            RunnerOperation::PersistentShell(RunnerPersistentShellOperation {
+                request: PersistentShellRequest {
+                    action: "status".to_string(),
+                    shell_id: "shell-1".to_string(),
+                    workflow_session_id: "wc_sess_123456".to_string(),
+                    runtime_project_id: "agent:runner-1:demo".to_string(),
+                    cwd: None,
+                    shell: None,
+                    command: None,
+                    timeout_secs: None,
+                    purpose: None,
+                },
+                job_context: None,
+            }),
+            RunnerOperation::McpGateway(McpGatewayRequest::ToolsList {
+                provider_id: "provider".to_string(),
+                provider_instance_id: "instance".to_string(),
+            }),
+            RunnerOperation::PluginGateway(PluginGatewayRequest::Reload),
+            RunnerOperation::CodingAgent(crate::coding_agent::CodingAgentRequest::Start(
+                crate::coding_agent::CodingAgentStartRequest {
+                    run_id: "wc_agent_run_0123456789abcdef".to_string(),
+                    intent_fingerprint: "cafebabe".to_string(),
+                    authority_fingerprint: "auth_0123456789abcdef".to_string(),
+                    runtime_project_id: "agent:runner-1:demo".to_string(),
+                    project_root: "/repo".to_string(),
+                    provider_id: "codex".to_string(),
+                    provider_instance_id: "provider_123".to_string(),
+                    instruction: "inspect repository".to_string(),
+                    config: std::collections::BTreeMap::new(),
+                    timeout_secs: 60,
+                },
+            )),
+            RunnerOperation::Skill(crate::runner_skill::RunnerSkillRequest::List),
+            RunnerOperation::SshResource(crate::ssh_resource::SshResourceRequest::List),
+            RunnerOperation::RunnerConfig(RunnerConfigOperationRequest {
+                action: crate::runner_protocol::RunnerConfigAction::Check,
+                expected_generation: None,
+            }),
+        ];
+
+        let file_operations = vec![
+            RunnerFileOperation::Read(RunnerFilePayload {
+                start_line: Some(1),
+                end_line: Some(1),
+                ..file_payload(None)
+            }),
+            RunnerFileOperation::Write(file_payload(Some("body"))),
+            RunnerFileOperation::List(file_payload(None)),
+            RunnerFileOperation::ListPage(file_payload(Some(r#"{"offset":0,"limit":20}"#))),
+            RunnerFileOperation::ProjectOverview(file_payload(None)),
+            RunnerFileOperation::DeleteProjectFiles(file_payload(None)),
+            RunnerFileOperation::WriteProjectFile(file_payload(None)),
+            RunnerFileOperation::ApplyTextEdits(file_payload(None)),
+            RunnerFileOperation::ApplyPatch(file_payload(None)),
+            RunnerFileOperation::SaveProjectArtifact(file_payload(None)),
+            RunnerFileOperation::ReadProjectArtifactMetadata(file_payload(None)),
+            RunnerFileOperation::ReadProjectArtifact(file_payload(None)),
+            RunnerFileOperation::ReadProjectArtifactExportChunk(file_payload(None)),
+            RunnerFileOperation::ArtifactUploadBegin(file_payload(None)),
+            RunnerFileOperation::ArtifactUploadChunk(file_payload(None)),
+            RunnerFileOperation::ArtifactUploadFinish(file_payload(None)),
+            RunnerFileOperation::ArtifactUploadAbort(file_payload(None)),
+            RunnerFileOperation::CheckpointCreate(file_payload(None)),
+            RunnerFileOperation::CheckpointRestore(file_payload(None)),
+            RunnerFileOperation::SkillListPackages(file_payload(None)),
+            RunnerFileOperation::SkillReadFile(file_payload(None)),
+        ];
+        operations.extend(file_operations.into_iter().map(RunnerOperation::File));
+
+        for kind in [
+            RunnerProjectOperationKind::Register,
+            RunnerProjectOperationKind::Create,
+            RunnerProjectOperationKind::ResolveOrRegister,
+            RunnerProjectOperationKind::PrepareManagedWorktree,
+            RunnerProjectOperationKind::LifecycleEnable,
+            RunnerProjectOperationKind::LifecycleDisable,
+            RunnerProjectOperationKind::LifecycleUnregister,
+        ] {
+            operations.push(RunnerOperation::Project(RunnerProjectOperation {
+                kind,
+                payload: "{}".to_string(),
+            }));
+        }
+
+        for kind in [
+            RunnerComputerOperationKind::ListWindows,
+            RunnerComputerOperationKind::ListApplications,
+            RunnerComputerOperationKind::LaunchApplication,
+            RunnerComputerOperationKind::ListDisplays,
+            RunnerComputerOperationKind::SnapshotDisplay,
+            RunnerComputerOperationKind::ReadClipboard,
+            RunnerComputerOperationKind::WriteClipboard,
+            RunnerComputerOperationKind::PointerMove,
+            RunnerComputerOperationKind::PointerClick,
+            RunnerComputerOperationKind::Snapshot,
+            RunnerComputerOperationKind::SnapshotRegion,
+            RunnerComputerOperationKind::AccessibilityStatus,
+            RunnerComputerOperationKind::AccessibilityTree,
+            RunnerComputerOperationKind::ElementState,
+            RunnerComputerOperationKind::ActivateWindow,
+            RunnerComputerOperationKind::Control,
+            RunnerComputerOperationKind::ScrollToElement,
+            RunnerComputerOperationKind::KeyInput,
+            RunnerComputerOperationKind::InputText,
+        ] {
+            operations.push(RunnerOperation::Computer(RunnerComputerOperation {
+                kind,
+                payload: "{}".to_string(),
+                timeout_secs: 30,
+            }));
+        }
+
+        let expected = BTreeSet::from([
+            "run_shell",
+            "run_process",
+            "run_script",
+            "run_internal_posix_script",
+            RUNNER_SKILL_EXECUTION_REQUEST_KIND,
+            "start_job",
+            "start_validation_job",
+            "start_build_job",
+            "start_process_job",
+            "start_detached_process_job",
+            "start_script_job",
+            "start_skill_resource_job",
+            "stop_job",
+            "file_read",
+            "file_write",
+            "file_list",
+            "file_list_page",
+            "file_project_overview",
+            "file_delete_project_files",
+            "file_write_project_file",
+            "file_apply_text_edits",
+            "file_apply_patch",
+            "file_save_project_artifact",
+            "file_read_project_artifact_metadata",
+            "file_read_project_artifact",
+            "file_read_project_artifact_export_chunk",
+            "file_artifact_upload_begin",
+            "file_artifact_upload_chunk",
+            "file_artifact_upload_finish",
+            "file_artifact_upload_abort",
+            "file_checkpoint_create",
+            "file_checkpoint_restore",
+            "file_skill_list_packages",
+            "file_skill_read_file",
+            "register_project",
+            "create_project",
+            "resolve_or_register_project",
+            "prepare_managed_worktree",
+            "project_lifecycle_enable",
+            "project_lifecycle_disable",
+            "project_lifecycle_unregister",
+            "computer_list_windows",
+            "computer_list_applications",
+            "computer_launch_application",
+            "computer_list_displays",
+            "computer_snapshot_display",
+            "computer_read_clipboard",
+            "computer_write_clipboard",
+            "computer_pointer_move",
+            "computer_pointer_click",
+            "computer_snapshot",
+            "computer_snapshot_region",
+            "computer_accessibility_status",
+            "computer_accessibility_tree",
+            "computer_element_state",
+            "computer_activate_window",
+            "computer_control",
+            "computer_scroll_to_element",
+            "computer_key_input",
+            "computer_input_text",
+            crate::validation_bridge::AGENT_VALIDATION_REQUEST_KIND,
+            crate::lsp_bridge::AGENT_LSP_REQUEST_KIND,
+            "persistent_shell",
+            "mcp_gateway",
+            "plugin_gateway",
+            "coding_agent",
+            RUNNER_SKILL_REQUEST_KIND,
+            "ssh_resource",
+            RUNNER_CONFIG_REQUEST_KIND,
+        ]);
+        let seen = operations
+            .into_iter()
+            .map(|operation| round_trip_kind(operation).kind)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(seen, expected.into_iter().map(str::to_string).collect());
+    }
+
+    #[test]
+    fn representative_v2_json_shapes_keep_field_names_and_canonical_payload_placement() {
+        let shell = serde_json::to_value(round_trip_kind(RunnerOperation::RunShell(
+            RunnerShellOperation {
+                cwd: Some("/repo".to_string()),
+                login: false,
+                command: "printf ok".to_string(),
+                shell: None,
+                stdin: None,
+                max_bytes: Some(4096),
+                timeout_secs: 30,
+                job_context: None,
+            },
+        )))
+        .unwrap();
+        assert_eq!(shell["kind"], "run_shell");
+        assert_eq!(shell["command"], "printf ok");
+        assert_eq!(shell["max_bytes"], 4096);
+        assert!(shell.get("process").is_none());
+        assert!(shell.get("script").is_none());
+
+        let process = serde_json::to_value(round_trip_kind(RunnerOperation::RunProcess(
+            RunnerProcessOperation {
+                cwd: None,
+                process: ShellProcessArgv {
+                    executable: "printf".to_string(),
+                    args: vec!["ok".to_string()],
+                },
+                stdin: None,
+                timeout_secs: 30,
+            },
+        )))
+        .unwrap();
+        assert_eq!(process["kind"], "run_process");
+        assert!(process.get("process").is_some());
+        assert!(process.get("script").is_none());
+        assert_eq!(process["command"], "");
+
+        let script = ShellScriptPayload {
+            language: ShellScriptLanguage::Sh,
+            script: "printf script".to_string(),
+            args: Vec::new(),
+        };
+        let script_value = serde_json::to_value(round_trip_kind(RunnerOperation::RunScript(
+            RunnerScriptOperation {
+                cwd: None,
+                script,
+                stdin: None,
+                timeout_secs: 30,
+            },
+        )))
+        .unwrap();
+        assert_eq!(script_value["kind"], "run_script");
+        assert!(script_value.get("script").is_some());
+        assert!(script_value.get("process").is_none());
+        assert_eq!(script_value["command"], "");
+
+        let plugin = serde_json::to_value(round_trip_kind(RunnerOperation::PluginGateway(
+            PluginGatewayRequest::Reload,
+        )))
+        .unwrap();
+        assert_eq!(plugin["kind"], "plugin_gateway");
+        assert!(plugin.get("plugin_gateway").is_some());
+        assert!(plugin.get("mcp_gateway").is_none());
+        assert!(plugin.get("coding_agent").is_none());
+    }
+
+    #[test]
+    fn representative_specialized_and_job_v2_json_fields_are_stable() {
+        fn assert_field(operation: RunnerOperation, kind: &str, field: &str) {
+            let value = serde_json::to_value(round_trip_kind(operation)).unwrap();
+            assert_eq!(value["kind"], kind);
+            assert!(
+                value.get(field).is_some(),
+                "{kind} must keep V2 field {field}"
+            );
+        }
+
+        assert_field(
+            RunnerOperation::Validation {
+                payload: ValidationBridgeRequest {
+                    protocol_version: crate::validation_bridge::VALIDATION_BRIDGE_PROTOCOL_VERSION,
+                    adapter_id: "pyright".to_string(),
+                    language: "python".to_string(),
+                    validation_kind: "typecheck".to_string(),
+                    project_id: "demo".to_string(),
+                    cwd: None,
+                    targets: Vec::new(),
+                    timeout_secs: 60,
+                },
+                timeout_secs: 60,
+            },
+            crate::validation_bridge::AGENT_VALIDATION_REQUEST_KIND,
+            "validation",
+        );
+        assert_field(
+            RunnerOperation::Lsp {
+                payload: RunnerLspPayload {
+                    project_id: "demo".to_string(),
+                    request: crate::lsp_bridge::RunnerLspRequest::Status,
+                },
+                timeout_secs: 30,
+            },
+            crate::lsp_bridge::AGENT_LSP_REQUEST_KIND,
+            "lsp",
+        );
+        assert_field(
+            RunnerOperation::Job(RunnerJobOperation::StartShell(RunnerJobShellOperation {
+                login: false,
+                job_id: "job-shell-json".to_string(),
+                cwd: Some("/repo".to_string()),
+                command: "printf job".to_string(),
+                shell: None,
+                timeout_secs: 60,
+                context: job_context(Some("/repo")),
+            })),
+            "start_job",
+            "job_context",
+        );
+        assert_field(
+            RunnerOperation::Job(RunnerJobOperation::StartDetachedProcess(
+                RunnerJobProcessOperation {
+                    job_id: "job-detached-json".to_string(),
+                    cwd: Some("/repo".to_string()),
+                    process: ShellProcessArgv {
+                        executable: "process".to_string(),
+                        args: vec!["arg".to_string()],
+                    },
+                    stdin: None,
+                    timeout_secs: 60,
+                    context: structured_job_context(
+                        Some("/repo"),
+                        "run_detached_process",
+                        None,
+                        None,
+                        1,
+                        false,
+                    ),
+                },
+            )),
+            "start_detached_process_job",
+            "process",
+        );
+        assert_field(
+            RunnerOperation::PersistentShell(RunnerPersistentShellOperation {
+                request: PersistentShellRequest {
+                    action: "status".to_string(),
+                    shell_id: "shell-json".to_string(),
+                    workflow_session_id: "wc_sess_123456".to_string(),
+                    runtime_project_id: "agent:runner-1:demo".to_string(),
+                    cwd: None,
+                    shell: None,
+                    command: None,
+                    timeout_secs: None,
+                    purpose: None,
+                },
+                job_context: None,
+            }),
+            "persistent_shell",
+            "persistent_shell",
+        );
+        assert_field(
+            RunnerOperation::McpGateway(McpGatewayRequest::ToolsList {
+                provider_id: "provider".to_string(),
+                provider_instance_id: "instance".to_string(),
+            }),
+            "mcp_gateway",
+            "mcp_gateway",
+        );
+        assert_field(
+            RunnerOperation::PluginGateway(PluginGatewayRequest::Reload),
+            "plugin_gateway",
+            "plugin_gateway",
+        );
+        assert_field(
+            RunnerOperation::CodingAgent(crate::coding_agent::CodingAgentRequest::Start(
+                crate::coding_agent::CodingAgentStartRequest {
+                    run_id: "wc_agent_run_0123456789abcdef".to_string(),
+                    intent_fingerprint: "cafebabe".to_string(),
+                    authority_fingerprint: "auth_0123456789abcdef".to_string(),
+                    runtime_project_id: "agent:runner-1:demo".to_string(),
+                    project_root: "/repo".to_string(),
+                    provider_id: "codex".to_string(),
+                    provider_instance_id: "provider_123".to_string(),
+                    instruction: "inspect repository".to_string(),
+                    config: std::collections::BTreeMap::new(),
+                    timeout_secs: 60,
+                },
+            )),
+            "coding_agent",
+            "coding_agent",
+        );
+        assert_field(
+            RunnerOperation::File(RunnerFileOperation::Write(file_payload(Some("body")))),
+            "file_write",
+            "path",
+        );
+        assert_field(
+            RunnerOperation::Project(RunnerProjectOperation {
+                kind: RunnerProjectOperationKind::Register,
+                payload: "{}".to_string(),
+            }),
+            "register_project",
+            "stdin",
+        );
+    }
+
+    #[test]
+    fn missing_or_cross_family_payloads_fail_closed() {
+        for (kind, expected) in [
+            ("run_process", "process payload"),
+            ("run_script", "script payload"),
+            (crate::lsp_bridge::AGENT_LSP_REQUEST_KIND, "lsp payload"),
+            ("persistent_shell", "persistent_shell payload"),
+            ("mcp_gateway", "mcp_gateway payload"),
+            ("plugin_gateway", "plugin_gateway payload"),
+            ("coding_agent", "coding_agent payload"),
+        ] {
+            let mut wire = shell_wire();
+            wire.kind = kind.to_string();
+            wire.command.clear();
+            wire.cwd = None;
+            let error = wire.decode_operation().unwrap_err();
+            assert!(error.contains(expected), "{kind}: {error}");
+        }
+
+        let mut raw_shell_with_process = shell_wire();
+        raw_shell_with_process.process = Some(ShellProcessArgv {
+            executable: "printf".to_string(),
+            args: Vec::new(),
+        });
+        assert!(raw_shell_with_process
+            .decode_operation()
+            .unwrap_err()
+            .contains("incompatible"));
+
+        let lsp = RunnerRequest::from_operation(
+            metadata(),
+            RunnerOperation::Lsp {
+                payload: RunnerLspPayload {
+                    project_id: "demo".to_string(),
+                    request: crate::lsp_bridge::RunnerLspRequest::Status,
+                },
+                timeout_secs: 30,
+            },
+        )
+        .unwrap();
+        let mut lsp_with_plugin = lsp;
+        lsp_with_plugin.plugin_gateway = Some(PluginGatewayRequest::Reload);
+        assert!(lsp_with_plugin
+            .decode_operation()
+            .unwrap_err()
+            .contains("conflicting"));
+
+        let mut plugin_with_mcp = RunnerRequest::from_operation(
+            metadata(),
+            RunnerOperation::PluginGateway(PluginGatewayRequest::Reload),
+        )
+        .unwrap();
+        plugin_with_mcp.mcp_gateway = Some(McpGatewayRequest::ToolsList {
+            provider_id: "provider".to_string(),
+            provider_instance_id: "instance".to_string(),
+        });
+        assert!(plugin_with_mcp
+            .decode_operation()
+            .unwrap_err()
+            .contains("conflicting"));
+    }
+}

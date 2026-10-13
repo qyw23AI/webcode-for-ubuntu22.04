@@ -1,0 +1,269 @@
+version = 1
+
+[layers]
+leaf = 0
+domain = 1
+runtime = 2
+application = 3
+composition = 4
+entrypoint = 5
+
+[root_test_support]
+feature = "root-test-support"
+providers = [
+    "webcodex-runner-registry",
+    "webcodex-store",
+    "webcodex-tool-contracts",
+    "webcodex-workflow-session",
+]
+
+[forbidden_external_dependencies]
+webcodex-cli = ["quinn", "rusqlite", "salvo"]
+webcodex-core = ["quinn", "rusqlite", "salvo"]
+webcodex-runner = ["rusqlite", "salvo"]
+
+[packages.webcodex]
+layer = "composition"
+role = "Server composition and protocol adapters."
+normal = [
+    "webcodex-admin",
+    "webcodex-build-info",
+    "webcodex-code-mode",
+    "webcodex-core",
+    "webcodex-environment",
+    "webcodex-openai-tunnel",
+    "webcodex-process",
+    "webcodex-runner-config",
+    "webcodex-runner-registry",
+    "webcodex-store",
+    "webcodex-tool-contracts",
+    "webcodex-tool-runtime-contracts",
+    "webcodex-validation",
+    "webcodex-workflow-session",
+    "webcodex-workspace",
+]
+dev = [
+    "webcodex-runner-registry",
+    "webcodex-store",
+    "webcodex-tool-contracts",
+    "webcodex-workflow-session",
+]
+build = []
+test_support = [
+    "webcodex-runner-registry",
+    "webcodex-store",
+    "webcodex-tool-contracts",
+    "webcodex-workflow-session",
+]
+
+[packages.webcodex-admin]
+layer = "leaf"
+role = "Standalone operator/admin HTTP client support."
+normal = []
+dev = []
+build = []
+test_support = []
+
+[packages.webcodex-build-info]
+layer = "runtime"
+role = "Checkout-dependent build identity for executable composition; core/domain crates must not depend on this package."
+normal = ["webcodex-core"]
+dev = []
+build = []
+test_support = []
+
+[packages.webcodex-browser]
+layer = "domain"
+role = "First-class bounded CDP browser runtime built on process lifecycle primitives."
+normal = ["webcodex-core", "webcodex-process", "webcodex-runner-config"]
+dev = []
+build = []
+test_support = []
+
+[packages.webcodex-cli]
+layer = "entrypoint"
+role = "User-facing CLI entrypoint over server composition and shared setup helpers."
+normal = [
+    "webcodex",
+    "webcodex-admin",
+    "webcodex-build-info",
+    "webcodex-core",
+    "webcodex-environment",
+    "webcodex-runner-config",
+]
+dev = []
+build = []
+test_support = []
+
+[packages.webcodex-code-mode]
+layer = "runtime"
+role = "Experimental transport-neutral Code Mode frontend/runtime and bounded V8 orchestration."
+normal = []
+dev = []
+build = []
+test_support = []
+
+[packages.webcodex-computer]
+layer = "leaf"
+role = "Platform-native computer-use primitives."
+normal = ["webcodex-core"]
+dev = []
+build = []
+test_support = []
+
+[packages.webcodex-core]
+layer = "leaf"
+role = "Shared contracts and low-level helpers with no workspace dependencies."
+normal = []
+dev = []
+build = []
+test_support = []
+
+[packages.webcodex-environment]
+layer = "runtime"
+role = "Shared environment setup, recovery, and persistent service lifecycle."
+normal = [
+    "webcodex-core",
+    "webcodex-openai-tunnel",
+    "webcodex-process",
+    "webcodex-runner-config",
+]
+dev = []
+build = []
+test_support = []
+
+[packages.webcodex-lsp]
+layer = "domain"
+role = "Native bounded Language Server Protocol lifecycle and semantic navigation."
+normal = [
+    "webcodex-core",
+    "webcodex-process",
+    "webcodex-runner-config",
+]
+dev = []
+build = []
+test_support = []
+
+[packages.webcodex-persistent-shell]
+layer = "domain"
+role = "Persistent local shell lifecycle built on process primitives."
+normal = ["webcodex-process"]
+dev = []
+build = []
+test_support = []
+
+[packages.webcodex-process]
+layer = "leaf"
+role = "OS process-tree ownership and lifecycle primitives."
+normal = []
+dev = []
+build = []
+test_support = []
+
+[packages.webcodex-runner]
+layer = "runtime"
+role = "Runner executable/runtime composition for local project execution."
+normal = [
+    "webcodex-browser",
+    "webcodex-build-info",
+    "webcodex-computer",
+    "webcodex-core",
+    "webcodex-environment",
+    "webcodex-lsp",
+    "webcodex-persistent-shell",
+    "webcodex-process",
+    "webcodex-runner-config",
+    "webcodex-validation",
+    "webcodex-workspace",
+]
+dev = []
+build = []
+test_support = []
+
+[packages.webcodex-runner-config]
+layer = "domain"
+role = "Runner configuration contracts and parsing."
+normal = ["webcodex-core"]
+dev = []
+build = []
+test_support = []
+
+[packages.webcodex-runner-registry]
+layer = "domain"
+role = "Server-side Runner registry, connection lease, queue, and reconciliation domain."
+normal = ["webcodex-core"]
+dev = []
+build = []
+test_support = []
+
+[packages.webcodex-store]
+layer = "domain"
+role = "Durable SQLite-backed persistence ownership."
+normal = ["webcodex-core"]
+dev = []
+build = []
+test_support = []
+
+[packages.webcodex-tool-contracts]
+layer = "domain"
+role = "Protocol-neutral tool schemas and parsing contracts."
+normal = ["webcodex-core"]
+dev = []
+build = []
+test_support = []
+
+[packages.webcodex-tool-runtime-contracts]
+layer = "runtime"
+role = "Tool runtime result, recorder metadata, and audit contracts."
+normal = [
+    "webcodex-core",
+    "webcodex-tool-contracts",
+    "webcodex-workflow-session",
+]
+dev = []
+build = []
+test_support = []
+
+[packages.webcodex-validation]
+layer = "domain"
+role = "Validation recipes, adapters, and evidence domain."
+normal = [
+    "webcodex-core",
+    "webcodex-tool-contracts",
+    "webcodex-workflow-session",
+    "webcodex-workspace",
+]
+dev = [
+    "webcodex-tool-contracts",
+    "webcodex-tool-runtime-contracts",
+    "webcodex-workflow-session",
+]
+build = []
+test_support = [
+    "webcodex-tool-contracts",
+    "webcodex-workflow-session",
+]
+
+[packages.webcodex-workflow-session]
+layer = "domain"
+role = "Workflow Session continuity, evidence, and handoff domain."
+normal = ["webcodex-core", "webcodex-tool-contracts"]
+dev = []
+build = []
+test_support = []
+
+[packages.webcodex-workspace]
+layer = "domain"
+role = "Registered project/workspace path and metadata contracts."
+normal = ["webcodex-core"]
+dev = []
+build = []
+test_support = []
+
+[packages.webcodex-openai-tunnel]
+layer = "leaf"
+role = "Standalone Secure MCP Tunnel client with bounded execution and immutable authority."
+normal = []
+dev = []
+build = []
+test_support = []

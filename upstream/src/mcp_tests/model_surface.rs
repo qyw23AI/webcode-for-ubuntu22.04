@@ -1,0 +1,960 @@
+use super::*;
+
+fn adaptive_direct_auth() -> crate::auth::AuthContext {
+    let mut auth = crate::auth::shared_key_context("adaptive-direct-test");
+    auth.scopes.extend([
+        crate::auth::SCOPE_PLUGIN_INSPECT.to_string(),
+        crate::auth::SCOPE_PLUGIN_INVOKE.to_string(),
+        crate::auth::SCOPE_PLUGIN_MANAGE.to_string(),
+    ]);
+    auth
+}
+
+fn tool_names(value: &Value) -> Vec<&str> {
+    value["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .map(|tool| tool["name"].as_str().expect("tool name"))
+        .collect()
+}
+
+#[tokio::test]
+async fn model_workflow_policy_changes_never_change_cached_tools_schemas_routes_or_apps() {
+    use crate::model_workflow::ModelWorkflowPolicy;
+    let auth = adaptive_direct_auth();
+    let full_schema_baseline = serde_json::to_vec(
+        &crate::mcp::tools::mcp_tools_list_payload_with_compact(false),
+    )
+    .unwrap();
+    for apps in [false, true] {
+        let mut listed_baseline = None;
+        let mut manifest_baseline = None;
+        for preference in ["on_demand", "preferred"] {
+            for mode in ["unknown", "user_confirmed", "unattended"] {
+                let runtime = test_runtime().with_model_workflow_policy(
+                    ModelWorkflowPolicy::from_values(Some(preference), Some(mode)).unwrap(),
+                );
+                let params = if apps {
+                    mcp_2026_ui_params(json!({}))
+                } else {
+                    mcp_2026_params(json!({}))
+                };
+                let McpOutcome::Ok(listed) = handle_mcp_request(
+                    &runtime,
+                    rpc("tools/list", Some(json!(160)), params),
+                    Some(&auth),
+                )
+                .await
+                else {
+                    panic!("tools/list");
+                };
+                let bytes = serde_json::to_vec(&listed["result"]).unwrap();
+                if let Some(expected) = &listed_baseline {
+                    assert_eq!(&bytes, expected);
+                } else {
+                    listed_baseline = Some(bytes);
+                }
+                let mut manifests = Vec::new();
+                for tool in [
+                    "present_goal_plan",
+                    "prepare_goal_workflow",
+                    "checkpoint_goal",
+                    "get_goal",
+                    "update_goal",
+                    "present_agent_continuation",
+                    "present_job_terminal_continuation",
+                ] {
+                    let args = json!({"name":"read_tool_manifest", "arguments":{"tool_name":tool}});
+                    let params = if apps {
+                        mcp_2026_ui_params(args)
+                    } else {
+                        mcp_2026_params(args)
+                    };
+                    let McpOutcome::Ok(manifest) = handle_mcp_request(
+                        &runtime,
+                        rpc("tools/call", Some(json!(161)), params),
+                        Some(&auth),
+                    )
+                    .await
+                    else {
+                        panic!("manifest {tool}");
+                    };
+                    manifests.push(manifest["result"].clone());
+                }
+                if let Some(expected) = &manifest_baseline {
+                    assert_eq!(&manifests, expected);
+                } else {
+                    manifest_baseline = Some(manifests);
+                }
+            }
+        }
+    }
+    // This static builder takes no Runtime/policy input. Check it once after
+    // the complete adapter matrix, not repeatedly inside every policy cell.
+    assert_eq!(
+        serde_json::to_vec(&crate::mcp::tools::mcp_tools_list_payload_with_compact(
+            false
+        ))
+        .unwrap(),
+        full_schema_baseline
+    );
+}
+
+#[tokio::test]
+async fn adaptive_tools_list_exposes_ranked_direct_tools_and_gateway() {
+    let runtime = test_runtime();
+    let auth = adaptive_direct_auth();
+    let outcome = handle_mcp_request(
+        &runtime,
+        rpc("tools/list", Some(json!(60)), mcp_2026_params(json!({}))),
+        Some(&auth),
+    )
+    .await;
+    let McpOutcome::Ok(value) = outcome else {
+        panic!("Adaptive tools/list must succeed");
+    };
+    let names = tool_names(&value);
+    assert!(names.contains(&crate::mcp::tools::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME));
+    let project_validate = value["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "project_validate")
+        .expect("project_validate must have a dedicated bounded descriptor");
+    assert_eq!(project_validate["annotations"]["readOnlyHint"], false);
+    assert_eq!(project_validate["annotations"]["destructiveHint"], false);
+    assert_eq!(project_validate["annotations"]["idempotentHint"], false);
+    assert_eq!(project_validate["annotations"]["openWorldHint"], false);
+    let gateway = value["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == crate::mcp::tools::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME)
+        .expect("Adaptive gateway descriptor");
+    assert_eq!(gateway["annotations"]["destructiveHint"], true);
+    #[cfg(feature = "experimental-code-mode")]
+    {
+        const MAX_EXPERIMENTAL_CODE_MODE_TOOL_BYTES: usize = 4 * 1024;
+        let code_mode = value["result"]["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .find(|tool| tool["name"] == "execute_code_mode")
+            .expect("experimental Code Mode feature must expose execute_code_mode directly");
+        let code_mode_bytes = serde_json::to_vec(code_mode).unwrap().len();
+        assert!(
+            code_mode_bytes <= MAX_EXPERIMENTAL_CODE_MODE_TOOL_BYTES,
+            "experimental execute_code_mode compact schema cost {code_mode_bytes} exceeded {MAX_EXPERIMENTAL_CODE_MODE_TOOL_BYTES} bytes"
+        );
+    }
+    assert!(
+        !names.contains(&"apply_patch"),
+        "long-tail tool leaked direct"
+    );
+    for specialist in webcodex_tool_contracts::EXACT_DISCOVERY_SPECIALIST_TOOL_NAMES {
+        assert!(
+            !names.contains(specialist),
+            "{specialist} must stay off the ordinary Adaptive direct surface"
+        );
+        assert!(
+            !crate::tool_runtime::tool_definition::is_adaptive_runtime_direct_tool(specialist),
+            "{specialist} must route through exact discovery/gateway"
+        );
+    }
+    for required in [
+        "work_on_project",
+        "read_files",
+        "search_project_texts",
+        "search_file_context",
+        "edit_project_files",
+        "run_process",
+        "write_job_input",
+        "run_script",
+        "run_shell",
+        "project_validate",
+        "review_changes",
+        "list_jobs",
+        "observe_jobs",
+        "wait_for_job_readiness",
+        "present_work_result",
+        "present_goal_plan",
+        "load_skill",
+    ] {
+        assert!(
+            names.contains(&required),
+            "missing Adaptive direct tool {required}"
+        );
+        assert!(
+            crate::tool_runtime::tool_definition::is_adaptive_runtime_direct_tool(required),
+            "{required} must derive direct admission from ToolDefinition rank"
+        );
+    }
+}
+
+#[tokio::test]
+async fn list_jobs_direct_and_gateway_preserve_caller_visibility_and_validation() {
+    use crate::runner_protocol::ShellJobOpRequest;
+    use webcodex_runner_registry::ShellJobStartMetadata;
+    let runtime = test_runtime();
+    let auth = crate::auth::shared_key_context("job-inventory-owner");
+    let foreign = crate::auth::shared_key_context("job-inventory-foreign");
+    let mut owned_job = None;
+    for (client, owner) in [("inventory-owner", &auth), ("inventory-foreign", &foreign)] {
+        let registration = serde_json::from_value::<RunnerRegisterRequest>(json!({
+            "client_id":client, "agent_instance_id":"inst",
+            "agent_protocol_generation":crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
+            "capabilities":{"shell":true,"jobs":true,"async_jobs":true,"async_shell_jobs":true}
+        }))
+        .unwrap();
+        let access = crate::test_support::runner_access(owner);
+        runtime
+            .runner_registry
+            .register_with_auth(
+                crate::test_support::current_runner_registration(registration),
+                Some(&access),
+            )
+            .await
+            .unwrap();
+        let job = runtime
+            .runner_registry
+            .start_job_with_metadata_for_access(
+                serde_json::from_value::<ShellJobOpRequest>(json!({
+                    "op":"start", "client_id":client, "command":"fixture", "timeout_secs":60
+                }))
+                .unwrap(),
+                "fixture".into(),
+                ShellJobStartMetadata::default(),
+                Some(&access),
+                None,
+            )
+            .await
+            .unwrap();
+        if client == "inventory-owner" {
+            owned_job = Some(job.job_id);
+        }
+    }
+    for stateless in [false, true] {
+        for arguments in [json!({}), json!({"project":" "})] {
+            let mut outputs = Vec::new();
+            for params in [
+                json!({"name":"list_jobs", "arguments":arguments}),
+                adaptive_runtime_gateway_params("list_jobs", arguments.clone()),
+            ] {
+                let params = if stateless {
+                    mcp_2026_params(params)
+                } else {
+                    params
+                };
+                let McpOutcome::Ok(value) = handle_mcp_request(
+                    &runtime,
+                    rpc("tools/call", Some(json!(1)), params),
+                    Some(&auth),
+                )
+                .await
+                else {
+                    panic!("list_jobs");
+                };
+                outputs.push(value["result"]["structuredContent"].clone());
+            }
+            assert_eq!(outputs[0], outputs[1]);
+            if arguments.get("project").is_none() {
+                assert_eq!(outputs[0]["success"], true);
+                assert_eq!(outputs[0]["output"]["count"], 1);
+                assert_eq!(
+                    outputs[0]["output"]["jobs"][0]["job_id"],
+                    owned_job.as_ref().unwrap().as_str()
+                );
+            } else {
+                assert_eq!(outputs[0]["success"], false);
+                assert_eq!(outputs[0]["output"]["error_kind"], "invalid_project_filter");
+            }
+        }
+    }
+    let McpOutcome::Ok(manifest) = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(2)),
+            mcp_2026_params(json!({
+                "name":"read_tool_manifest", "arguments":{"tool_name":"list_jobs"}
+            })),
+        ),
+        Some(&auth),
+    )
+    .await
+    else {
+        panic!("manifest");
+    };
+    let route = &manifest["result"]["structuredContent"]["output"]["route"];
+    assert_eq!(route["primary"]["mode"], "direct");
+    assert_eq!(route["fallback"]["tool"], "call_runtime_tool");
+}
+
+#[tokio::test]
+async fn adaptive_gateway_annotations_cover_admitted_runtime_tool_effects() {
+    for stateless in [false, true] {
+        for compact in [false, true] {
+            let McpOutcome::Ok(value) =
+                crate::mcp::tools::handle_list(Some(json!(1)), None, stateless, compact, false)
+                    .await
+            else {
+                panic!("tools/list");
+            };
+            let gateway = &value["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == "call_runtime_tool")
+                .expect("gateway descriptor")["annotations"];
+            let mut open_world_targets = Vec::new();
+            for spec in registered_tool_specs() {
+                if !crate::mcp::tools::adaptive_runtime_gateway_target_admitted_for_test(
+                    &spec.name, stateless,
+                ) {
+                    continue;
+                }
+                for (hint, conservative) in [
+                    ("readOnlyHint", false),
+                    ("destructiveHint", true),
+                    ("idempotentHint", false),
+                    ("openWorldHint", true),
+                ] {
+                    if spec.annotations[hint] == conservative {
+                        assert_eq!(gateway[hint], conservative, "{}: {hint}", spec.name);
+                    }
+                }
+                if spec.annotations["openWorldHint"] == true {
+                    open_world_targets.push(spec.name);
+                }
+            }
+            assert!(open_world_targets.iter().any(|name| name == "run_process"));
+            assert!(open_world_targets.iter().any(|name| name == "run_script"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn interactive_job_input_prefers_direct_and_keeps_gateway_fallback() {
+    let runtime = test_runtime();
+    let outcome = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(69)),
+            mcp_2026_params(json!({
+                "name": "read_tool_manifest",
+                "arguments": {"tool_name": "write_job_input"}
+            })),
+        ),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(value) = outcome else {
+        panic!("write_job_input manifest must succeed");
+    };
+    let output = &value["result"]["structuredContent"]["output"];
+    assert_eq!(output["route"]["primary"]["mode"], "direct");
+    assert_eq!(output["route"]["primary"]["tool"], "write_job_input");
+    assert_eq!(output["route"]["fallback"]["mode"], "gateway");
+    assert_eq!(output["route"]["fallback"]["tool"], "call_runtime_tool");
+    assert_eq!(output["route"]["fallback"]["target"], "write_job_input");
+    assert_eq!(
+        output["route"]["fallback"]["when"],
+        "direct_callable_unavailable"
+    );
+    assert_eq!(
+        output["route"]["fallback"]["blocked_when_mcp_apps_enabled"],
+        false
+    );
+    assert_eq!(output["route"]["tool_manifest_registers_host_tool"], false);
+}
+
+#[tokio::test]
+async fn specialist_tools_remain_discoverable_with_canonical_gateway_contracts() {
+    let runtime = test_runtime();
+    let listed = crate::mcp::tools::mcp_tools_list_payload_with_compact(false);
+    for name in [
+        "cargo_check",
+        "cargo_test",
+        "go_test",
+        "read_workspace_changes",
+        "read_session_handoff",
+        "rotate_agent_continuation_endpoint",
+        "run_skill_resource",
+        "wait_for_agent_events",
+        "wait_for_job_terminal",
+    ] {
+        let definition = webcodex_tool_contracts::lookup_tool_definition(name).unwrap();
+        assert!(definition.visibility.is_model_visible());
+        assert_eq!(definition.adaptive_runtime_direct_rank(), None);
+        assert!(!listed["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == name));
+        let McpOutcome::Ok(value) = handle_mcp_request(
+            &runtime,
+            rpc(
+                "tools/call",
+                Some(json!(67)),
+                mcp_2026_params(json!({
+                    "name": "read_tool_manifest", "arguments": {"tool_name": name}
+                })),
+            ),
+            None,
+        )
+        .await
+        else {
+            panic!("manifest {name}");
+        };
+        let output = &value["result"]["structuredContent"]["output"];
+        assert_eq!(output["route"]["primary"]["mode"], "gateway", "{name}");
+        assert_eq!(output["route"]["primary"]["tool"], "call_runtime_tool");
+        assert_eq!(output["route"]["primary"]["target"], name);
+        assert_eq!(
+            output["input_schema"],
+            webcodex_tool_contracts::input_schema_for_tool(name)
+        );
+        assert_eq!(
+            output["effect"],
+            definition.metadata().effect.manifest_label()
+        );
+        assert_eq!(
+            output["idempotency"],
+            definition.metadata().idempotency.manifest_label()
+        );
+        assert!(crate::mcp::tools::adaptive_runtime_gateway_target_admitted_for_test(name, true));
+    }
+}
+
+#[tokio::test]
+async fn continuation_presentations_are_direct_and_preserve_app_routing_and_scopes() {
+    let runtime = test_runtime_with_mcp_settings(true, true);
+    for apps in [false, true] {
+        for name in [
+            "present_agent_continuation",
+            "present_job_terminal_continuation",
+        ] {
+            assert_eq!(
+                crate::model_surface::suggested_tool_call_route(name, false),
+                crate::model_surface::SuggestedToolCallRoute::Direct
+            );
+            assert!(
+                crate::mcp::tools::adaptive_runtime_gateway_target_admitted_for_test(name, true)
+            );
+            let listed = crate::mcp::tools::mcp_tools_list_payload_with_features_for_auth(
+                false, apps, true, None,
+            );
+            let descriptor = listed["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .expect("dedicated continuation descriptor");
+            assert_eq!(descriptor["annotations"]["readOnlyHint"], true);
+            assert_eq!(descriptor["annotations"]["idempotentHint"], true);
+            let resource = if name == "present_agent_continuation" {
+                MCP_AGENT_CONTINUATION_UI_RESOURCE_URI
+            } else {
+                MCP_JOB_TERMINAL_CONTINUATION_UI_RESOURCE_URI
+            };
+            assert_eq!(
+                descriptor.pointer("/_meta/ui/resourceUri"),
+                apps.then_some(&json!(resource))
+            );
+            let params = json!({"name":"read_tool_manifest", "arguments":{"tool_name":name}});
+            let params = if apps {
+                mcp_2026_ui_params(params)
+            } else {
+                mcp_2026_params(params)
+            };
+            let McpOutcome::Ok(manifest) =
+                handle_mcp_request(&runtime, rpc("tools/call", Some(json!(68)), params), None)
+                    .await
+            else {
+                panic!("manifest {name}");
+            };
+            let output = &manifest["result"]["structuredContent"]["output"];
+            assert_eq!(output["route"]["primary"]["mode"], "direct", "{name}");
+            assert_eq!(output["route"]["primary"]["tool"], name);
+            assert_eq!(output["effect"], "observe");
+            assert_eq!(output["idempotency"], "pure_read");
+            for (gateway, params) in [
+                (false, json!({"name": name, "arguments": {}})),
+                (true, adaptive_runtime_gateway_params(name, json!({}))),
+            ] {
+                let params = if apps {
+                    mcp_2026_ui_params(params)
+                } else {
+                    mcp_2026_params(params)
+                };
+                let outcome =
+                    handle_mcp_request(&runtime, rpc("tools/call", Some(json!(68)), params), None)
+                        .await;
+                if gateway && apps {
+                    let McpOutcome::BadRequest(value) = outcome else {
+                        panic!("{name}: {outcome:?}");
+                    };
+                    assert!(
+                        value["error"]["message"]
+                            .as_str()
+                            .unwrap()
+                            .contains("call_runtime_tool cannot invoke MCP App presentation"),
+                        "{value}"
+                    );
+                } else if name == "present_agent_continuation" {
+                    let McpOutcome::Ok(value) = outcome else {
+                        panic!("expected canonical Agent selector validation: {outcome:?}");
+                    };
+                    let result = &value["result"]["structuredContent"];
+                    assert_eq!(result["success"], false);
+                    assert_eq!(
+                        result["output"]["error_kind"],
+                        "incomplete_agent_continuation_selector"
+                    );
+                    assert_eq!(result["output"]["state_changed"], false);
+                } else {
+                    assert!(
+                        matches!(outcome, McpOutcome::BadRequest(_)),
+                        "{name}: {outcome:?}"
+                    );
+                }
+            }
+
+            let mut unscoped = adaptive_direct_auth();
+            unscoped.kind = crate::auth::AuthKind::OAuth2Token;
+            unscoped.scopes.clear();
+            let scoped_list = crate::mcp::tools::mcp_tools_list_payload_with_features_for_auth(
+                false,
+                apps,
+                true,
+                Some(&unscoped),
+            );
+            assert!(!scoped_list["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == name));
+            let arguments = if name == "present_agent_continuation" {
+                json!({"agent_id": "wc_dagent_qqqqqqqqqqqqqqqq",
+                    "endpoint_id": "wc_endpoint_u7u7u7u7u7u7u7u7", "expected_controller_generation": 1})
+            } else {
+                json!({"wait_id": "wc_job_wait_q6urq6urq6urq6ur"})
+            };
+            let params = json!({"name": name, "arguments": arguments});
+            let params = if apps {
+                mcp_2026_ui_params(params)
+            } else {
+                mcp_2026_params(params)
+            };
+            let denied = handle_mcp_request(
+                &runtime,
+                rpc("tools/call", Some(json!(69)), params),
+                Some(&unscoped),
+            )
+            .await;
+            assert!(
+                matches!(denied, McpOutcome::Forbidden { .. }),
+                "{name}: {denied:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn retired_endpoint_name_is_absent_from_adaptive_exact_discovery() {
+    let runtime = test_runtime();
+    let old = "attach_agent_endpoint";
+    assert!(webcodex_tool_contracts::lookup_tool_definition(old).is_none());
+    assert_eq!(
+        crate::model_surface::suggested_tool_call_route(old, false),
+        crate::model_surface::SuggestedToolCallRoute::Unavailable
+    );
+    let outcome = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(69)),
+            mcp_2026_params(json!({
+                "name":"read_tool_manifest", "arguments":{"tool_name":old}
+            })),
+        ),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(value) = outcome else {
+        panic!("exact manifest: {outcome:?}")
+    };
+    let result = &value["result"]["structuredContent"];
+    assert_eq!(result["success"], false);
+    assert_eq!(result["output"]["code"], "unknown_tool_manifest_tool");
+    assert!(result["output"].get("tools").is_none());
+    assert!(result["output"].get("route").is_none());
+}
+
+#[tokio::test]
+async fn long_tail_manifest_routes_through_call_runtime_tool() {
+    let runtime = test_runtime();
+    let outcome = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(61)),
+            mcp_2026_params(json!({
+                "name": "read_tool_manifest",
+                "arguments": {"tool_name": "apply_patch"}
+            })),
+        ),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(value) = outcome else {
+        panic!("read_tool_manifest must succeed");
+    };
+    let output = &value["result"]["structuredContent"]["output"];
+    assert_eq!(output["route"]["primary"]["mode"], "gateway");
+    assert_eq!(output["route"]["primary"]["tool"], "call_runtime_tool");
+    assert_eq!(output["route"]["primary"]["target"], "apply_patch");
+    assert!(output["route"]["fallback"].is_null());
+    assert_eq!(output["route"]["tool_manifest_registers_host_tool"], false);
+}
+
+#[tokio::test]
+async fn closeout_helpers_remain_visible_with_exact_gateway_contracts() {
+    let runtime = test_runtime();
+    for name in ["check_workspace_hygiene", "finish_coding_task"] {
+        let definition =
+            crate::tool_runtime::tool_definition::lookup_tool_definition(name).unwrap();
+        assert!(definition.visibility.is_model_visible());
+        assert_eq!(definition.adaptive_runtime_direct_rank(), None);
+        let listed = crate::mcp::tools::mcp_tools_list_payload_with_compact(false);
+        assert!(!listed["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == name));
+        let McpOutcome::Ok(value) = handle_mcp_request(
+            &runtime,
+            rpc(
+                "tools/call",
+                Some(json!(66)),
+                mcp_2026_params(json!({
+                    "name": "read_tool_manifest", "arguments": {"tool_name": name},
+                })),
+            ),
+            None,
+        )
+        .await
+        else {
+            panic!("manifest {name}");
+        };
+        let output = &value["result"]["structuredContent"]["output"];
+        assert_eq!(output["route"]["primary"]["mode"], "gateway");
+        assert_eq!(output["route"]["primary"]["tool"], "call_runtime_tool");
+        assert_eq!(output["route"]["primary"]["target"], name);
+        assert!(output["route"]["fallback"].is_null());
+        assert_eq!(output["route"]["tool_manifest_registers_host_tool"], false);
+        assert_eq!(
+            output["input_schema"],
+            webcodex_tool_contracts::input_schema_for_tool(name)
+        );
+        assert_eq!(output["effect"], "observe");
+        assert!(crate::mcp::tools::adaptive_runtime_gateway_target_admitted_for_test(name, true));
+    }
+}
+
+#[tokio::test]
+async fn long_tail_direct_call_is_rejected_with_gateway_guidance() {
+    let runtime = test_runtime();
+    let outcome = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(62)),
+            mcp_2026_params(json!({
+                "name": "apply_patch",
+                "arguments": {
+                    "project": "missing-project",
+                    "patch": "*** Begin Patch\n*** Add File: route-probe.txt\n+probe\n*** End Patch",
+                    "dry_run": true
+                }
+            })),
+        ),
+        None,
+    )
+    .await;
+    let McpOutcome::BadRequest(value) = outcome else {
+        panic!("direct long-tail invocation must be rejected");
+    };
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(message.contains("call_runtime_tool"), "{message}");
+    assert!(
+        message.contains("not directly callable on Adaptive Runtime"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn long_tail_and_direct_targets_are_both_admitted_through_gateway() {
+    let runtime = test_runtime();
+    for (id, tool, arguments) in [
+        (
+            63,
+            "apply_patch",
+            json!({
+                "project": "missing-project",
+                "patch": "*** Begin Patch\n*** Add File: route-probe.txt\n+probe\n*** End Patch",
+                "dry_run": true
+            }),
+        ),
+        (
+            64,
+            "read_files",
+            json!({"project": "missing-project", "items": [{"path": "x"}]}),
+        ),
+    ] {
+        let outcome = handle_mcp_request(
+            &runtime,
+            rpc(
+                "tools/call",
+                Some(json!(id)),
+                mcp_2026_params(json!({
+                    "name": "call_runtime_tool",
+                    "arguments": {"tool": tool, "arguments": arguments}
+                })),
+            ),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(outcome, McpOutcome::Ok(_)),
+            "gateway must admit canonical target {tool}: {outcome:?}"
+        );
+    }
+}
+
+#[test]
+fn hidden_protocol_extensions_require_protocol_admission() {
+    assert!(!crate::tool_runtime::tool_definition::is_model_visible_tool_name("list_skills"));
+    assert!(
+        !crate::mcp::tools::adaptive_runtime_gateway_target_admitted_for_test("list_skills", false,)
+    );
+    assert!(
+        crate::mcp::tools::adaptive_runtime_gateway_target_admitted_for_test("list_skills", true,)
+    );
+    assert!(
+        !crate::mcp::tools::adaptive_runtime_gateway_target_admitted_for_test(
+            "definitely_unknown_tool",
+            true,
+        )
+    );
+}
+
+#[tokio::test]
+async fn call_runtime_tool_cannot_target_itself() {
+    let runtime = test_runtime();
+    let outcome = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(65)),
+            mcp_2026_params(json!({
+                "name": "call_runtime_tool",
+                "arguments": {
+                    "tool": "call_runtime_tool",
+                    "arguments": {"tool": "read_files", "arguments": {}}
+                }
+            })),
+        ),
+        None,
+    )
+    .await;
+    let McpOutcome::BadRequest(value) = outcome else {
+        panic!("recursive gateway call must be rejected");
+    };
+    assert!(value["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("cannot target itself"));
+}
+
+#[tokio::test]
+async fn call_runtime_tool_rejects_direct_app_presentation_targets_when_apps_are_enabled() {
+    let runtime = test_runtime();
+    for (index, target) in ["present_work_result", "present_pdf", "present_goal_plan"]
+        .into_iter()
+        .enumerate()
+    {
+        let request = rpc(
+            "tools/call",
+            Some(json!(70 + index)),
+            mcp_2026_ui_params(adaptive_runtime_gateway_params(target, json!({}))),
+        );
+        let protocol_era = super::super::inferred_protocol_era(&request);
+        let outcome = super::super::handle_mcp_request_with_lifecycle(
+            &runtime,
+            request,
+            None,
+            protocol_era,
+            super::super::HostFileImportTrust::Untrusted,
+            None,
+            None,
+            None,
+            crate::model_surface::effective_mcp_compact_schemas(
+                crate::config::mcp_compact_schemas_override(),
+            ),
+            true,
+            None,
+        )
+        .await;
+        let McpOutcome::BadRequest(value) = outcome else {
+            panic!("{target} must require its direct MCP App presentation route");
+        };
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(message.contains("call_runtime_tool cannot invoke MCP App presentation tool"));
+        assert!(message.contains(target));
+        assert!(message.contains("directly"));
+    }
+}
+
+#[tokio::test]
+async fn pruned_tools_keep_exact_manifest_and_canonical_gateway_validation() {
+    let runtime = test_runtime();
+    for (name, arguments) in [
+        (
+            "wait_for_job_terminal",
+            json!({"job_id":"missing", "idempotency_key":"surface-parity"}),
+        ),
+        (
+            "wait_for_agent_events",
+            json!({
+                "agent_id":"wc_dagent_qqqqqqqqqqqqqqqq",
+                "endpoint_id":"wc_endpoint_qqqqqqqqqqqqqqqq",
+                "expected_controller_generation":1,
+                "events":[{"kind":"agent_task_terminal", "task_id":"wc_agent_task_qqqqqqqqqqqqqqqq"}],
+                "idempotency_key":"surface-parity"
+            }),
+        ),
+        (
+            "stop_job",
+            json!({"project": "missing", "job_id": "missing", "confirm": true}),
+        ),
+        (
+            "run_detached_process",
+            json!({"project": "missing", "executable": "missing", "idempotency_key": "surface-parity"}),
+        ),
+        (
+            "transfer_project_artifact",
+            json!({"source_project": "missing", "source_path": "a", "destination_project": "missing", "destination_path": "b"}),
+        ),
+    ] {
+        assert!(!webcodex_tool_contracts::is_adaptive_runtime_direct_tool(
+            name
+        ));
+        let McpOutcome::Ok(manifest) = handle_mcp_request(
+            &runtime,
+            rpc(
+                "tools/call",
+                Some(json!(1)),
+                mcp_2026_params(
+                    json!({"name": "read_tool_manifest", "arguments": {"tool_name": name}}),
+                ),
+            ),
+            None,
+        )
+        .await
+        else {
+            panic!("manifest {name}")
+        };
+        let output = &manifest["result"]["structuredContent"]["output"];
+        assert_eq!(output["route"]["primary"]["mode"], "gateway");
+        assert_eq!(output["route"]["primary"]["target"], name);
+        let call = crate::tool_runtime::ToolCall::from_tool_name(name, arguments.clone()).unwrap();
+        let canonical = runtime.dispatch(call).await;
+        let McpOutcome::Ok(result) = handle_mcp_request(
+            &runtime,
+            rpc(
+                "tools/call",
+                Some(json!(2)),
+                mcp_2026_params(adaptive_runtime_gateway_params(name, arguments.clone())),
+            ),
+            None,
+        )
+        .await
+        else {
+            panic!("gateway {name}")
+        };
+        let actual = &result["result"]["structuredContent"];
+        assert_eq!(actual["success"], canonical.success, "{name}");
+        assert_eq!(
+            actual["output"]["error_kind"], canonical.output["error_kind"],
+            "{name}"
+        );
+        let mut invalid = arguments;
+        invalid["unknown_business_field"] = json!(true);
+        assert!(crate::tool_runtime::ToolCall::from_tool_name(name, invalid.clone()).is_err());
+        let result = handle_mcp_request(
+            &runtime,
+            rpc(
+                "tools/call",
+                Some(json!(3)),
+                mcp_2026_params(adaptive_runtime_gateway_params(name, invalid)),
+            ),
+            None,
+        )
+        .await;
+        match result {
+            McpOutcome::Ok(value) => {
+                assert_eq!(value["result"]["structuredContent"]["success"], false)
+            }
+            McpOutcome::BadRequest(_) => {}
+            other => panic!("invalid {name}: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn natural_language_manifest_is_identical_through_direct_and_gateway_routes() {
+    let runtime = test_runtime();
+    let auth = adaptive_direct_auth();
+    for (query, expected) in [
+        ("Find documentation for this symbol", "read_symbol_hover"),
+        ("读取暂存补丁的差异行", "read_git_diff_hunks"),
+        ("Start an executable with literal arguments", "run_process"),
+    ] {
+        let arguments = json!({"query":query,"limit":5});
+        let mut baseline = None;
+        for params in [
+            json!({"name":"read_tool_manifest","arguments":arguments}),
+            adaptive_runtime_gateway_params("read_tool_manifest", arguments.clone()),
+        ] {
+            let McpOutcome::Ok(result) = handle_mcp_request(
+                &runtime,
+                rpc("tools/call", Some(json!(1)), mcp_2026_params(params)),
+                Some(&auth),
+            )
+            .await
+            else {
+                panic!("manifest {query}")
+            };
+            assert_eq!(result["result"]["isError"], false, "{result:?}");
+            let output = &result["result"]["structuredContent"]["output"];
+            let names = output["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tool| tool["name"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert!(names.contains(&expected), "{query}: {result:?}");
+            assert!(names.len() <= 5);
+            assert!(output["contract"].is_null());
+            assert!(!result.to_string().contains("discoveryKeywords"));
+            if let Some(baseline) = &baseline {
+                assert_eq!(output, baseline);
+            } else {
+                baseline = Some(output.clone());
+            }
+        }
+    }
+}

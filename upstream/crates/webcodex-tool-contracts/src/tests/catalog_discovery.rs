@@ -1,0 +1,965 @@
+use super::*;
+use std::collections::BTreeSet;
+
+fn registered_tool_categories() -> Value {
+    json!(group_tool_names_by_category(
+        model_visible_tool_definitions().map(|definition| definition.name)
+    ))
+}
+fn recommended_flows() -> Vec<&'static str> {
+    crate::tool_catalog::model_visible_recommended_flows()
+        .map(|flow| flow.summary)
+        .collect()
+}
+
+#[test]
+fn model_tool_contracts_do_not_teach_retired_runner_as_agent_prose() {
+    for spec in registered_tool_specs() {
+        let rendered = format!(
+            "{}\n{}\n{}",
+            spec.description, spec.input_schema, spec.output_schema
+        )
+        .to_ascii_lowercase();
+        for retired in [
+            "agent-registered",
+            "agent registry",
+            "owning registered agent",
+            "agent project config",
+            "an runner",
+        ] {
+            assert!(
+                !rendered.contains(retired),
+                "{} still exposes retired Runner-as-Agent prose: {retired}",
+                spec.name
+            );
+        }
+    }
+}
+
+#[test]
+fn list_tools_schema_exposes_bounded_discovery_fields() {
+    let specs = registered_tool_specs();
+    let spec = spec_named(&specs, "list_tools");
+    let props = spec.input_schema["properties"].as_object().unwrap();
+    assert_schema_fields!(
+        props,
+        "list_tools input schema",
+        present: ["category", "features", "summary_only", "limit"]
+    );
+    assert!(spec.input_schema["required"].as_array().unwrap().is_empty());
+    let output = spec.output_schema["properties"]["output"]["properties"]
+        .as_object()
+        .unwrap();
+    assert_schema_fields!(
+        output,
+        "list_tools output schema",
+        present: [
+            "category", "features", "limit", "returned_count", "total_count",
+            "filtered_count", "limit_applied", "requested_limit", "truncation_reason",
+            "truncated", "categories", "recommended_flows",
+        ]
+    );
+}
+
+#[test]
+fn tool_manifest_schema_exposes_compact_discovery_fields() {
+    let specs = registered_tool_specs();
+    let spec = spec_named(&specs, "read_tool_manifest");
+    let props = spec.input_schema["properties"].as_object().unwrap();
+    assert_schema_fields!(
+        props,
+        "read_tool_manifest input schema",
+        present: ["category", "intent", "include_recommended_flows", "include_risk_summary"]
+    );
+    let flow_description = props["include_recommended_flows"]["description"]
+        .as_str()
+        .expect("include_recommended_flows description");
+    assert!(flow_description.contains("exact tool_name"));
+    assert!(flow_description.contains("false"));
+    assert!(flow_description.contains("category"));
+    assert!(flow_description.contains("intent"));
+    assert!(flow_description.contains("true"));
+    let risk_summary_description = props["include_risk_summary"]["description"]
+        .as_str()
+        .expect("include_risk_summary description");
+    assert!(risk_summary_description.contains("aggregate risks in broad output"));
+    assert!(risk_summary_description.contains("focused output keeps per-tool risks"));
+    assert!(risk_summary_description.contains("No authority change"));
+    assert!(!risk_summary_description.contains("Include risk_summary in the output"));
+    let output = spec.output_schema["properties"]["output"]["properties"]
+        .as_object()
+        .unwrap();
+    assert_schema_fields!(
+        output,
+        "read_tool_manifest output schema",
+        present: [
+            "schema_version", "count", "tool_count", "filtered_count", "category", "intent",
+            "available_intents", "filtered", "categories_requested", "limit", "returned_count",
+            "total_count", "limit_applied", "requested_limit", "truncation_reason", "truncated",
+            "categories", "tools", "risk_summary", "recommended_flows",
+        ]
+    );
+}
+
+#[test]
+fn tool_recommended_flows_reference_visible_defined_tools() {
+    let expected_summaries = crate::tool_catalog::model_visible_recommended_flows()
+        .map(|flow| {
+            assert!(!flow.name.trim().is_empty());
+            assert!(!flow.manifest_purpose.trim().is_empty(), "{}", flow.name);
+            assert!(flow.summary.chars().count() <= 300, "{}", flow.name);
+            assert!(!flow.tools.is_empty(), "{}", flow.name);
+            for tool in flow.tools {
+                let definition = lookup_tool_definition(tool)
+                    .unwrap_or_else(|| panic!("{} references unknown tool {tool}", flow.name));
+                assert!(
+                    definition.visibility.is_model_visible(),
+                    "{}: {tool}",
+                    flow.name
+                );
+                assert!(is_model_visible_tool_name(tool), "{}: {tool}", flow.name);
+            }
+            for native in ["run_process", "run_script", "run_shell"] {
+                if flow.manifest_purpose.contains(native) {
+                    assert!(
+                        flow.tools.contains(&native),
+                        "{} purpose recommends {native} but its machine-readable tools omit it",
+                        flow.name
+                    );
+                }
+            }
+            flow.summary
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(recommended_flows(), expected_summaries);
+}
+
+#[test]
+fn continuation_recipes_reference_admitted_model_tools() {
+    for flow in TOOL_RECOMMENDED_FLOWS {
+        assert!(flow
+            .tools
+            .iter()
+            .all(|name| lookup_tool_definition(name).is_some()));
+    }
+    for name in ["agent_continuation_setup", "goal_agent_wait_orchestration"] {
+        assert!(TOOL_RECOMMENDED_FLOWS.iter().any(|flow| flow.name == name));
+        assert!(
+            crate::tool_catalog::model_visible_recommended_flows().any(|flow| flow.name == name)
+        );
+    }
+}
+
+#[test]
+fn agent_continuation_setup_flow_is_focused_and_keeps_resume_tools_separate() {
+    let flow = TOOL_RECOMMENDED_FLOWS
+        .iter()
+        .find(|flow| flow.name == "agent_continuation_setup")
+        .expect("agent_continuation_setup recommended flow");
+    assert_eq!(
+        flow.tools,
+        &[
+            "create_agent_identity",
+            "rotate_agent_continuation_endpoint",
+            "present_agent_continuation",
+            "list_agent_identities",
+        ]
+    );
+    let guidance = format!("{}\n{}", flow.summary, flow.manifest_purpose).to_lowercase();
+    for phrase in [
+        "new durable agent window setup",
+        "normal final assistant response",
+        "let the current turn finalize promptly",
+        "card/tool result alone does not end it",
+        "on a later turn",
+        "production_auto_resume_available",
+        "presentation success is not host readiness",
+    ] {
+        assert!(
+            guidance.contains(phrase),
+            "setup flow should mention {phrase}: {guidance}"
+        );
+    }
+    for resume_tool in ["bootstrap_agent_conversation", "consume_agent_wake"] {
+        assert!(!flow.tools.contains(&resume_tool));
+    }
+}
+
+#[test]
+fn single_window_goal_workflow_prefers_atomic_admission_and_keeps_host_setup_separate() {
+    let flow = TOOL_RECOMMENDED_FLOWS
+        .iter()
+        .find(|flow| flow.name == "single_window_goal_workflow")
+        .expect("single_window_goal_workflow recommended flow");
+    assert_eq!(
+        flow.tools,
+        &[
+            "work_on_project",
+            "get_goal",
+            "prepare_goal_workflow",
+            "present_goal_plan",
+            "checkpoint_goal",
+            "finish_coding_task",
+            "update_goal",
+        ]
+    );
+    for host_setup in [
+        "create_agent_identity",
+        "rotate_agent_continuation_endpoint",
+        "present_agent_continuation",
+        "list_agent_identities",
+    ] {
+        assert!(
+            !flow.tools.contains(&host_setup),
+            "ordinary Goal flow duplicated Host continuation setup: {host_setup}"
+        );
+    }
+    let guidance = format!("{}\n{}", flow.summary, flow.manifest_purpose).to_lowercase();
+    for phrase in [
+        "goal_context",
+        "reuse one exact candidate",
+        "with multiple candidates, read candidate details through exact get_goal calls",
+        "explicitly choose one before present_goal_plan",
+        "get_goal",
+        "prepare_goal_workflow",
+        "durable admission only",
+        "host carrier setup/readiness remains separate",
+        "optional cross-repository workflow",
+        "consult current webcodex.workflow context for selection",
+        "only after selecting durable goal work",
+        "agent_continuation_setup",
+        "low-level create_goal and associate_goal_workflow_session remain available",
+    ] {
+        assert!(
+            guidance.contains(phrase),
+            "single-window Goal flow should mention {phrase}: {guidance}"
+        );
+    }
+
+    let categories = registered_tool_categories();
+    let goal_tools = categories["goal"].as_array().unwrap();
+    for low_level_or_composed in [
+        "prepare_goal_workflow",
+        "create_goal",
+        "associate_goal_workflow_session",
+    ] {
+        assert!(
+            goal_tools
+                .iter()
+                .any(|tool| tool.as_str() == Some(low_level_or_composed)),
+            "Goal discovery lost {low_level_or_composed}"
+        );
+    }
+}
+
+#[test]
+fn goal_agent_wait_orchestration_flow_registers_before_worker_execution_without_discovery() {
+    let flow = TOOL_RECOMMENDED_FLOWS
+        .iter()
+        .find(|flow| flow.name == "goal_agent_wait_orchestration")
+        .expect("goal_agent_wait_orchestration recommended flow");
+    let associate = flow
+        .tools
+        .iter()
+        .position(|tool| *tool == "associate_goal_agent_task")
+        .unwrap();
+    let wait = flow
+        .tools
+        .iter()
+        .position(|tool| *tool == "wait_for_agent_events")
+        .unwrap();
+    let start = flow
+        .tools
+        .iter()
+        .position(|tool| *tool == "start_agent_task_attempt")
+        .unwrap();
+    let dispatch = flow
+        .tools
+        .iter()
+        .position(|tool| *tool == "start_agent_task_endpoint_continuation")
+        .unwrap();
+    let bootstrap = flow
+        .tools
+        .iter()
+        .position(|tool| *tool == "bootstrap_agent_conversation")
+        .unwrap();
+    let consume = flow
+        .tools
+        .iter()
+        .position(|tool| *tool == "consume_agent_wake")
+        .unwrap();
+    assert!(associate < wait && wait < start && start < dispatch);
+    assert!(dispatch < bootstrap && bootstrap < consume);
+    for required in [
+        "start_agent_task_endpoint_continuation",
+        "bootstrap_agent_conversation",
+        "consume_agent_wake",
+        "read_agent_wait",
+        "get_goal",
+        "read_agent_task",
+        "update_goal",
+    ] {
+        assert!(flow.tools.contains(&required), "missing {required}");
+    }
+    let guidance = format!("{}\n{}", flow.summary, flow.manifest_purpose).to_lowercase();
+    for phrase in [
+        "before any selected worker can terminalize",
+        "explicit 1..8 task selector list",
+        "any for first-result continuation",
+        "all for fan-in",
+        "only after registration start each worker with start_agent_task_attempt followed by start_agent_task_endpoint_continuation",
+        "fresh resumed coordinator turn bootstrap the exact wake",
+        "consume it immediately",
+        "never derive the wait source list from goal correlations",
+        "not treat this flow as a scheduler",
+        "explicitly decide/update goal state",
+    ] {
+        assert!(
+            guidance.contains(phrase),
+            "Goal AgentWait flow should mention {phrase}: {guidance}"
+        );
+    }
+}
+
+#[test]
+fn edit_recommended_flow_converges_on_one_primary_editor() {
+    let flow = TOOL_RECOMMENDED_FLOWS
+        .iter()
+        .find(|flow| flow.name == "edit")
+        .expect("edit recommended flow");
+    assert_eq!(flow.tools.first().copied(), Some("read_files"));
+    assert_eq!(flow.tools.get(1).copied(), Some("edit_project_files"));
+    assert_eq!(flow.tools.get(2).copied(), Some("project_validate"));
+    assert!(flow.tools.contains(&"review_changes"));
+    assert!(flow.tools.contains(&"finish_coding_task"));
+    for specialist in EXACT_MANIFEST_SPECIALIST_TOOL_NAMES {
+        assert!(!flow.tools.contains(specialist), "{specialist}");
+    }
+    let guidance = format!("{}\n{}", flow.summary, flow.manifest_purpose).to_lowercase();
+    for phrase in [
+        "read_files",
+        "edit_project_files",
+        "read_revision",
+        "exact and deterministic range edits share one primary editor",
+        "structured validation",
+        "review_changes",
+        "finish_coding_task",
+        "exact-name specialists",
+        "read_workspace_changes",
+        "read_git_review_summary",
+        "read_git_diff_hunks",
+    ] {
+        assert!(
+            guidance.contains(phrase),
+            "edit flow should mention {phrase}: {guidance}"
+        );
+    }
+    for obsolete in [
+        "canonical default even when many lines change",
+        "after read_files, apply_text_edits with current sha is the default",
+        "apply_patch for patch-shaped changes",
+    ] {
+        assert!(
+            !guidance.contains(obsolete),
+            "obsolete edit ritual returned: {guidance}"
+        );
+    }
+}
+
+#[test]
+fn execution_lifetime_flow_routes_runner_owned_and_supervisor_owned_work() {
+    let flow = TOOL_RECOMMENDED_FLOWS
+        .iter()
+        .find(|flow| flow.name == "execution_lifetime")
+        .expect("execution_lifetime recommended flow");
+    assert_eq!(
+        flow.tools,
+        &[
+            "run_process",
+            "run_script",
+            "run_shell",
+            "run_job",
+            "run_detached_process",
+            "execute_session_shell",
+            "observe_jobs",
+            "stop_job",
+        ]
+    );
+    let text = format!("{}\n{}", flow.summary, flow.manifest_purpose).to_ascii_lowercase();
+    for phrase in [
+        "runner-owned sync-first",
+        "run_script",
+        "supervisor-owned immediate async",
+        "execute_session_shell",
+        "duration alone is not a reason to detach",
+    ] {
+        assert!(
+            text.contains(phrase),
+            "execution_lifetime flow should mention {phrase}: {text}"
+        );
+    }
+}
+
+#[test]
+fn tool_categories_and_recommended_flows_are_well_formed() {
+    let categories = registered_tool_categories();
+    let names = registered_tool_names();
+    for (cat, members) in categories.as_object().unwrap() {
+        let arr = members.as_array().unwrap();
+        assert!(!arr.is_empty(), "category '{cat}' must not be empty");
+        for member in arr {
+            let name = member.as_str().unwrap();
+            assert!(
+                names.iter().any(|candidate| candidate == name),
+                "{cat}: {name}"
+            );
+        }
+    }
+    for category in [
+        TOOL_CATEGORY_FILE,
+        TOOL_CATEGORY_ARTIFACT,
+        TOOL_CATEGORY_GIT,
+        TOOL_CATEGORY_VALIDATION,
+        TOOL_CATEGORY_EXECUTION,
+        TOOL_CATEGORY_JOB,
+        TOOL_CATEGORY_RUNTIME,
+        TOOL_CATEGORY_SESSION,
+        TOOL_CATEGORY_SKILL,
+        TOOL_CATEGORY_PLUGIN,
+        TOOL_CATEGORY_CLEANUP,
+        #[cfg(feature = "workspace-checkpoints")]
+        TOOL_CATEGORY_CHECKPOINT,
+    ] {
+        assert!(
+            categories.get(category).is_some(),
+            "missing category {category}"
+        );
+    }
+    for (name, category) in [
+        ("project_build", TOOL_CATEGORY_EXECUTION),
+        ("run_process", TOOL_CATEGORY_EXECUTION),
+        ("run_script", TOOL_CATEGORY_EXECUTION),
+        ("run_shell", TOOL_CATEGORY_EXECUTION),
+        ("run_detached_process", TOOL_CATEGORY_EXECUTION),
+        ("run_job", TOOL_CATEGORY_EXECUTION),
+        ("execute_session_shell", TOOL_CATEGORY_EXECUTION),
+        ("observe_jobs", TOOL_CATEGORY_JOB),
+        ("stop_job", TOOL_CATEGORY_JOB),
+        ("cargo_test", TOOL_CATEGORY_VALIDATION),
+        ("read_files", TOOL_CATEGORY_FILE),
+        ("review_changes", TOOL_CATEGORY_GIT),
+        ("read_workspace_changes", TOOL_CATEGORY_GIT),
+        ("import_host_files", TOOL_CATEGORY_ARTIFACT),
+        ("load_skill", TOOL_CATEGORY_SKILL),
+        ("run_skill_resource", TOOL_CATEGORY_SKILL),
+        ("plugin_tool", TOOL_CATEGORY_PLUGIN),
+    ] {
+        assert!(
+            categories[category]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item == name),
+            "{name}"
+        );
+    }
+    // Categories are complete taxonomy, not recommendation rankings. Hidden
+    // specialists/extensions still require their independent admission path.
+    assert!(categories.get(TOOL_CATEGORY_MEMORY).is_none());
+    for members in categories.as_object().unwrap().values() {
+        for hidden in EXACT_MANIFEST_SPECIALIST_TOOL_NAMES {
+            assert!(!members
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item == hidden));
+        }
+    }
+    let flows = recommended_flows();
+    assert!(!flows.is_empty());
+    for flow in &flows {
+        assert!(flow.chars().count() <= 300, "flow too long: {flow}");
+    }
+    let joined_flows = flows.join("\n").to_lowercase();
+    for phrase in [
+        "if the user gives an exact runner client_id",
+        "get_runtime_status/list_projects for that runner",
+        "persistent shell: primarily reuse one shell",
+        "keep remote shell state",
+        "manage_ssh_resource list/register -> restart -> list -> bind -> open/reuse",
+        "local shell is only for same-process state",
+        "one-shot ssh uses run_process",
+        "execution selection: run_process/run_script/run_shell and structured validation are runner-owned sync-first",
+        "run_job is runner-owned immediate async",
+        "run_detached_process is supervisor-owned immediate async",
+        "execute_session_shell continues an existing session shell",
+        "inspect: choose the simplest sufficient primitive",
+        "native commands are first-class for small bounded observations",
+        "search_project_texts/read_files when batching",
+        "edit: read_files → edit_project_files",
+        "exact and deterministic range edits share one primary editor",
+        "specialists require exact-name discovery",
+        "validate: use structured validators when their canonical diagnostics",
+        "native execution is first-class when the command is outside or awkward",
+        "file transfer: host -> import_host_files -> project",
+        "project -> inspect_project_artifact -> host/model",
+        "project a -> transfer_project_artifact -> project b",
+        "inspect for one bounded segment",
+        "export for complete resourcelink delivery",
+        "copy read_workspace_changes.head.commit",
+        "review: use review_changes as the primary ordinary workspace or committed review surface",
+        "same-snapshot token",
+        "old review tools remain specialists",        "handoff/recovery only",
+        "read_session_handoff only for missing task context",
+        "never routine progress polling",
+    ] {
+        assert!(
+            joined_flows.contains(phrase),
+            "recommended flows should mention {phrase}"
+        );
+    }
+}
+
+#[test]
+fn recommended_flows_encode_simplest_sufficient_selection_without_old_rituals() {
+    let flow = |name: &str| {
+        TOOL_RECOMMENDED_FLOWS
+            .iter()
+            .find(|flow| flow.name == name)
+            .unwrap_or_else(|| panic!("missing recommended flow {name}"))
+    };
+
+    let inspect = format!(
+        "{}\n{}",
+        flow("inspect").summary,
+        flow("inspect").manifest_purpose
+    )
+    .to_lowercase();
+    for phrase in [
+        "simplest sufficient primitive",
+        "native commands are first-class for small bounded observations",
+        "batching",
+        "read_revision",
+        "snapshot continuation",
+    ] {
+        assert!(inspect.contains(phrase), "inspect selection: {phrase}");
+    }
+
+    let validate = format!(
+        "{}\n{}",
+        flow("validate").summary,
+        flow("validate").manifest_purpose
+    )
+    .to_lowercase();
+    for phrase in [
+        "canonical diagnostics",
+        "test-count",
+        "validation identity",
+        "native validation is first-class",
+        "run_process for one literal-argv executable",
+        "run_shell when shell grammar/output shaping is required",
+    ] {
+        assert!(validate.contains(phrase), "validate selection: {phrase}");
+    }
+
+    let review = format!(
+        "{}\n{}",
+        flow("review").summary,
+        flow("review").manifest_purpose
+    )
+    .to_lowercase();
+    for phrase in [
+        "review_changes",
+        "primary ordinary workspace or committed review surface",
+        "same-snapshot token",
+        "old review tools remain specialists",
+        "hygiene stays authoritative and separate",
+    ] {
+        assert!(review.contains(phrase), "review selection: {phrase}");
+    }
+
+    let all = TOOL_RECOMMENDED_FLOWS
+        .iter()
+        .flat_map(|flow| [flow.summary, flow.manifest_purpose])
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_lowercase();
+    for obsolete in [
+        "prefer search_project_texts/read_files even for one query/range",
+        "use search_project_texts/read_files for inspection even with one query or range",
+        "canonical default even when many lines change",
+        "use structured rust or go validation",
+        "use run_shell only for shell-specific validation",
+    ] {
+        assert!(
+            !all.contains(obsolete),
+            "obsolete selection ritual returned: {obsolete}"
+        );
+    }
+}
+
+#[test]
+fn discovery_and_persistent_shell_flows_route_high_value_adaptive_tools() {
+    let discovery = TOOL_RECOMMENDED_FLOWS
+        .iter()
+        .find(|flow| flow.name == "discovery")
+        .expect("discovery recommended flow");
+    for tool in ["get_runtime_status", "list_runners", "list_projects"] {
+        assert!(discovery.tools.contains(&tool), "discovery: {tool}");
+    }
+    assert!(discovery.summary.contains("exact Runner client_id"));
+    assert!(discovery.summary.contains("before treating it as absent"));
+    for phrase in [
+        "get_runtime_status(client_id=...)",
+        "list_projects(client_id=...)",
+        "list_runners",
+    ] {
+        assert!(
+            discovery.manifest_purpose.contains(phrase),
+            "discovery: {phrase}"
+        );
+    }
+    assert!(!discovery.tools.contains(&"list_agents"));
+    assert!(!discovery.manifest_purpose.contains("list_agents"));
+
+    let persistent = TOOL_RECOMMENDED_FLOWS
+        .iter()
+        .find(|flow| flow.name == "persistent_shell")
+        .expect("persistent shell recommended flow");
+    assert_eq!(
+        persistent.tools.first().copied(),
+        Some("manage_ssh_resource")
+    );
+    assert_eq!(
+        persistent.tools.get(1).copied(),
+        Some("update_session_context")
+    );
+    assert_eq!(persistent.tools.get(2).copied(), Some("open_session_shell"));
+    assert_eq!(
+        persistent.tools.get(3).copied(),
+        Some("execute_session_shell")
+    );
+    assert!(persistent.tools.contains(&"get_session_shell_status"));
+    assert!(persistent.tools.contains(&"close_session_shell"));
+    assert!(persistent.tools.contains(&"run_process"));
+    assert!(persistent.summary.contains("primarily reuse one shell"));
+    assert!(persistent.summary.contains("active named SSH resource"));
+    assert!(persistent.summary.contains("remote shell state"));
+    assert!(persistent
+        .summary
+        .contains("manage_ssh_resource list/register"));
+    assert!(persistent
+        .summary
+        .contains("restart -> list -> bind -> open/reuse"));
+    assert!(persistent
+        .summary
+        .contains("Local shell is only for same-process state"));
+    assert!(persistent.summary.contains("one-shot SSH uses run_process"));
+    assert!(persistent
+        .manifest_purpose
+        .contains("SSH target does not run WebCodex Runner"));
+    assert!(persistent
+        .manifest_purpose
+        .contains("manage_ssh_resource list"));
+    assert!(persistent
+        .manifest_purpose
+        .contains("manage_ssh_resource register"));
+    for phrase in [
+        "ssh-resource-primary",
+        "execute_session_shell repeatedly preserves remote cwd/env/exports/functions/umask",
+        "local persistent shell remains supported only when same local-process state is required",
+        "several ordinary local commands are not enough",
+        "explicit one-shot/no-persistence ssh",
+    ] {
+        assert!(
+            persistent
+                .manifest_purpose
+                .to_ascii_lowercase()
+                .contains(phrase),
+            "persistent_shell should mention {phrase}: {}",
+            persistent.manifest_purpose
+        );
+    }
+    for tool in [
+        "manage_ssh_resource",
+        "update_session_context",
+        "open_session_shell",
+        "execute_session_shell",
+        "get_session_shell_status",
+        "close_session_shell",
+        "run_process",
+    ] {
+        assert!(
+            persistent.manifest_purpose.contains(tool),
+            "persistent_shell: {tool}"
+        );
+    }
+}
+
+#[test]
+fn tool_categories_include_edit_group() {
+    let categories = registered_tool_categories();
+    let edit = categories[TOOL_CATEGORY_EDIT]
+        .as_array()
+        .expect("edit category present");
+    for present in ["edit_project_files"] {
+        assert!(edit.iter().any(|value| value == present));
+    }
+    for hidden in EXACT_MANIFEST_SPECIALIST_TOOL_NAMES {
+        assert!(!edit.iter().any(|value| value == hidden), "{hidden}");
+    }
+    for removed in ["replace_in_file", "replace_line_range", "insert_at_line"] {
+        assert!(!edit.iter().any(|value| value == removed));
+    }
+}
+
+#[test]
+fn tool_categories_include_projects_with_management_tools() {
+    let categories = registered_tool_categories();
+    let projects = categories[TOOL_CATEGORY_PROJECT]
+        .as_array()
+        .expect("projects category present");
+    assert!(projects.iter().any(|value| value == "register_project"));
+    assert!(projects.iter().any(|value| value == "create_project"));
+}
+
+#[test]
+fn tool_manifest_intents_reference_only_known_model_visible_tools() {
+    // High-level intent views rank canonical choices; exact compatibility
+    // primitives remain discoverable by tool_name without becoming peer choices.
+
+    let expected = [
+        "maintenance",
+        "resources",
+        "coding",
+        "audit",
+        "exploration",
+        "file_transfer",
+        "release",
+        "discovery",
+    ];
+    let names = TOOL_MANIFEST_INTENTS
+        .iter()
+        .map(|intent| intent.name)
+        .collect::<Vec<_>>();
+    assert_eq!(names, expected);
+    assert_eq!(available_tool_manifest_intent_names(), names);
+    for name in &names {
+        let resolved = resolve_tool_manifest_intent(name)
+            .unwrap_or_else(|unknown| panic!("available intent {unknown} must resolve"))
+            .unwrap_or_else(|| panic!("available intent {name} must not resolve as empty"));
+        assert_eq!(resolved.name, *name);
+    }
+
+    let mut seen = BTreeSet::new();
+    for intent in TOOL_MANIFEST_INTENTS {
+        assert!(!intent.tools.is_empty(), "{}", intent.name);
+        assert!(seen.insert(intent.name), "duplicate intent {}", intent.name);
+        for tool in intent.tools {
+            assert!(is_known_tool_name(tool), "{}: {tool}", intent.name);
+            assert!(is_model_visible_tool_name(tool), "{}: {tool}", intent.name);
+            if matches!(intent.name, "audit" | "exploration" | "release") {
+                assert_ne!(*tool, "run_shell", "{}", intent.name);
+                assert_ne!(*tool, "run_job", "{}", intent.name);
+            }
+        }
+    }
+}
+
+#[test]
+fn audit_and_exploration_intents_prefer_canonical_batch_and_review_tools() {
+    for intent_name in ["audit", "exploration"] {
+        let intent = TOOL_MANIFEST_INTENTS
+            .iter()
+            .find(|intent| intent.name == intent_name)
+            .unwrap();
+        assert!(intent.tools.contains(&"read_files"), "{intent_name}");
+        assert!(
+            intent.tools.contains(&"search_project_texts"),
+            "{intent_name}"
+        );
+        assert!(!intent.tools.contains(&"read_file"), "{intent_name}");
+        assert!(
+            !intent.tools.contains(&"search_project_text"),
+            "{intent_name}"
+        );
+    }
+    let audit = TOOL_MANIFEST_INTENTS
+        .iter()
+        .find(|intent| intent.name == "audit")
+        .unwrap();
+    assert!(audit.tools.contains(&"review_changes"));
+    for specialist in ORDINARY_DISCOVERY_DEMOTED_REVIEW_TOOL_NAMES {
+        assert!(!audit.tools.contains(specialist), "{specialist}");
+    }
+    assert!(!audit.tools.contains(&"git_diff_summary"));
+
+    let release = TOOL_MANIFEST_INTENTS
+        .iter()
+        .find(|intent| intent.name == "release")
+        .unwrap();
+    assert!(release.tools.contains(&"review_changes"));
+    for specialist in ORDINARY_DISCOVERY_DEMOTED_REVIEW_TOOL_NAMES {
+        assert!(!release.tools.contains(specialist), "{specialist}");
+    }
+    assert!(!release.tools.contains(&"git_diff_summary"));
+}
+
+#[test]
+fn ordinary_validation_flows_prefer_project_gateway_and_keep_specialists_out() {
+    let edit = TOOL_RECOMMENDED_FLOWS
+        .iter()
+        .find(|flow| flow.name == "edit")
+        .unwrap();
+    assert!(edit.tools.contains(&"project_validate"));
+    assert!(!edit.tools.contains(&"cargo_check"));
+    assert!(!edit.tools.contains(&"cargo_test"));
+
+    let validate = TOOL_RECOMMENDED_FLOWS
+        .iter()
+        .find(|flow| flow.name == "validate")
+        .unwrap();
+    assert!(validate.tools.contains(&"project_validate"));
+    assert!(validate.tools.contains(&"cargo_fmt"));
+    assert!(validate.tools.contains(&"observe_jobs"));
+    for advanced in ["cargo_check", "cargo_test", "go_test", "job_status"] {
+        assert!(!validate.tools.contains(&advanced), "{advanced}");
+    }
+
+    let release = TOOL_MANIFEST_INTENTS
+        .iter()
+        .find(|intent| intent.name == "release")
+        .unwrap();
+    assert!(release.tools.contains(&"project_validate"));
+    assert!(release.tools.contains(&"cargo_fmt"));
+    for advanced in ["cargo_check", "cargo_test", "go_test"] {
+        assert!(!release.tools.contains(&advanced), "{advanced}");
+    }
+}
+
+#[test]
+fn project_overview_manifest_profiles_match_intended_workflows() {
+    for intent in ["coding", "audit", "exploration", "discovery"] {
+        let profile = TOOL_MANIFEST_INTENTS
+            .iter()
+            .find(|profile| profile.name == intent)
+            .unwrap_or_else(|| panic!("missing {intent} intent"));
+        assert!(profile.tools.contains(&"read_project_overview"), "{intent}");
+    }
+    let release = TOOL_MANIFEST_INTENTS
+        .iter()
+        .find(|profile| profile.name == "release")
+        .expect("release intent");
+    assert!(!release.tools.contains(&"read_project_overview"));
+}
+
+#[test]
+fn coding_intent_has_independent_ordered_canonical_selection_surface() {
+    let coding = TOOL_MANIFEST_INTENTS
+        .iter()
+        .find(|intent| intent.name == "coding")
+        .expect("coding intent");
+    assert_eq!(coding.tools, CODING_INTENT_TOOL_NAMES);
+    assert_eq!(coding.tools.first().copied(), Some("work_on_project"));
+    assert_eq!(coding.tools.last().copied(), Some("finish_coding_task"));
+
+    let mut seen = BTreeSet::new();
+    for tool in CODING_INTENT_TOOL_NAMES {
+        assert!(seen.insert(*tool), "duplicate coding intent tool {tool}");
+    }
+    for required in [
+        "work_on_project",
+        "search_project_texts",
+        "read_files",
+        "edit_project_files",
+        "run_process",
+        "run_shell",
+        "observe_jobs",
+        "project_validate",
+        "review_changes",
+        "check_workspace_hygiene",
+        "finish_coding_task",
+        "run_script",
+        "cargo_fmt",
+        "find_definition",
+        "find_references",
+    ] {
+        assert!(coding.tools.contains(&required), "missing {required}");
+    }
+    for advanced_specialist in ["cargo_check", "cargo_test", "go_test"] {
+        assert!(
+            !coding.tools.contains(&advanced_specialist),
+            "coding intent should prefer project_validate over {advanced_specialist}"
+        );
+    }
+    for compatibility_or_overlap in [
+        "read_file",
+        "search_project_text",
+        "git_diff",
+        "git_diff_summary",
+        "job_status",
+        "job_log",
+        "run_job",
+        "apply_patch",
+        "apply_unified_diff",
+        "write_project_file",
+        "start_coding_agent",
+        "observe_coding_agent",
+        "cancel_coding_agent",
+        "get_session_assignment",
+        "complete_session_message",
+    ] {
+        assert!(
+            !coding.tools.contains(&compatibility_or_overlap),
+            "coding intent should not recommend {compatibility_or_overlap}"
+        );
+    }
+    let read_files_position = coding
+        .tools
+        .iter()
+        .position(|tool| *tool == "read_files")
+        .unwrap();
+    let edit_project_files_position = coding
+        .tools
+        .iter()
+        .position(|tool| *tool == "edit_project_files")
+        .unwrap();
+    assert!(read_files_position < edit_project_files_position);
+}
+
+#[test]
+fn canonical_categories_are_complete_unique_sorted_and_selection_scoped() {
+    let names = model_visible_tool_definitions()
+        .map(|definition| definition.name)
+        .collect::<Vec<_>>();
+    let categories = group_tool_names_by_category(names.iter().copied());
+    let mut seen = BTreeSet::new();
+    for (category, members) in &categories {
+        assert!(!members.is_empty());
+        assert!(members.windows(2).all(|pair| pair[0] < pair[1]));
+        for name in members {
+            assert!(
+                seen.insert(*name),
+                "duplicate category membership for {name}"
+            );
+            assert_eq!(lookup_tool_definition(name).unwrap().category, *category);
+        }
+    }
+    assert_eq!(seen, names.iter().copied().collect());
+    assert_eq!(
+        categories,
+        group_tool_names_by_category(names.iter().rev().copied())
+    );
+    let selected =
+        group_tool_names_by_category(["run_shell", "run_process", "run_shell", "__unknown_tool__"]);
+    assert_eq!(selected.len(), 1);
+    assert_eq!(
+        selected[TOOL_CATEGORY_EXECUTION],
+        ["run_process", "run_shell"]
+    );
+    // The helper neither discovers nor admits extensions. An adapter may supply
+    // an independently admitted extension without also exposing its siblings.
+    let extension = group_tool_names_by_category(["read_memory"]);
+    assert_eq!(extension.len(), 1);
+    assert_eq!(extension[TOOL_CATEGORY_MEMORY], ["read_memory"]);
+}

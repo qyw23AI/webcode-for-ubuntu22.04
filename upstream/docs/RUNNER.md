@@ -1,0 +1,841 @@
+# Runner
+
+The Runner is the component that executes the actual work. The executable is
+`webcodex-runner`; the CLI namespace that manages it is `webcodex runner ...`.
+`webcodex` and `webcodex-runner` are separate executables. Operator lifecycle
+commands use the `runner` namespace; historical `agent` terminology remains only
+where it is part of a compatibility-facing token, storage, identity, project-id,
+or wire contract. This page explains what the Runner does, how it connects, how it
+registers projects, how to operate it as a service, and its main runtime
+concepts.
+
+For installation and service setup, see [Deployment](DEPLOYMENT.md). For the
+commands that manage the Runner, see [CLI](CLI.md#runner-lifecycle).
+
+## What the Runner does
+
+The Runner runs on the machine that owns the repositories. It connects out to
+a WebCodex Server, registers the projects it is allowed to serve, and executes
+bounded operations — file reads and edits, Git inspection, structured
+validation, shell commands, and long-running Jobs — inside those project
+boundaries.
+
+The Runner is the trust boundary closest to your repository. Configure it with
+narrow allowed roots and explicit shell profiles rather than broad interactive
+shell state.
+
+## Core terms
+
+| Term | Meaning |
+| --- | --- |
+| **Server** | Authenticates callers, stores shared runtime state, and routes work. |
+| **CLI** | The `webcodex` operator/developer command. |
+| **Runner** | The `webcodex-runner` process that executes repository work. |
+| **profile** | A named local Runner/client configuration. |
+| **client_id** | Stable logical name for one Runner/device. |
+| **Project** | A repository/workspace registered by that Runner. |
+
+Some compatibility-facing values still use the historical word `agent`, including the `wc_agent_*` Runner-token prefix and `agent:<client_id>:<project_id>` runtime Project address. They do not refer to WebCodex's separate Durable Agent domain, and ordinary users do not need the process-level lease identifiers behind Runner recovery.
+
+### Runner configuration names
+
+WebCodex 0.5 uses only the canonical Runner startup names: automatic/default/profile discovery targets `runner.toml`, the default-path environment override is `WEBCODEX_RUNNER_CONFIG`, the registry field is `project_registry_dir`, and the default registry directory is `project-registry/`. The 0.4.x compatibility inputs `agent.toml`, `WEBCODEX_AGENT_CONFIG`, `projects_dir`, and automatic `projects.d/` discovery are no longer startup inputs. A retired `projects_dir` field is rejected rather than silently ignored so an old configuration cannot appear to start against a different registry. Explicit `--config PATH` remains an exact caller-selected path; its filename is not reinterpreted.
+## Connecting to the Server
+
+The Runner connects out to the Server using one of four transports, selected by
+the `transport` setting in `runner.toml`:
+
+| Transport | Config value | Use |
+| --- | --- | --- |
+| Auto | `auto` | Recommended for production when `[quic]` is configured: QUIC first, then WebSocket, then polling. |
+| QUIC | `quic` | Strict QUIC only. Separate UDP listener on the Server. |
+| WebSocket | `websocket` | Stable fallback for simple deployments without UDP. |
+| Polling | `polling` | Last-resort fallback for constrained networks. |
+
+The Runner authenticates with its Runner token (compatibility prefix `wc_agent_*`) or, in hosted shared-key mode, the matching shared key. This credential is for Runner transport only; it is not an MCP or REST credential.
+
+WebSocket and polling authenticate the first-party Runner with
+`Authorization: Bearer <token>`; query-string Runner credentials are not
+accepted. QUIC keeps its credential in the transport-specific v1 first-register
+frame while the shared Runner envelope remains credential-free.
+
+### Server/Runner compatibility
+
+When upgrading an older installation across the 0.4 boundary, upgrade the first-party Server and Runner together. Within `0.4.x`, first-party releases keep a stable protocol baseline and add new optional capabilities explicitly; when an older compatible Runner lacks one of those capabilities, that feature fails closed instead of being guessed or emulated.
+
+The exact protocol-generation field names, baseline capability list, registration grammar, and compatibility-test matrix are maintainer/wire-contract details and are intentionally omitted from this operations guide.
+
+Streaming Runners register before gathering project Git metadata. The initial
+project catalog is scanned in one process-owned background worker, then sent
+through the usual acknowledged inventory pages. Registration, keepalive and
+shutdown remain responsive while a large or slow catalog is being inspected;
+project inventory can still be pending just after the Runner connects. Reconnects
+reuse an in-flight scan, and process shutdown cancels its Git probes through the
+existing owned-tree cleanup path.
+
+A ChatGPT Host message that the current conversation does not support developer
+MCPs is not a Runner heartbeat or reconnect result. If ChatGPT cannot dispatch
+`get_runtime_status`, first run `webcodex runner status` locally (and inspect bounded
+Runner logs) before restarting or changing Runner configuration. See
+[Troubleshooting](TROUBLESHOOTING.md) for the Host-vs-Server-vs-Runner decision
+tree.
+
+If you use QUIC, keep Server and Runner QUIC settings compatible. `[quic].keepalive_interval_secs` defaults to 20 seconds and accepts `1..=25`; invalid values are rejected rather than silently clamped.
+
+## Registering projects
+
+Projects live on the Runner machine. The Runner registers allowed directories
+with the Server; the Server does not scan the filesystem and does not invent
+project paths.
+
+Each registered project is a one-file-per-project TOML file in the Runner's
+`project_registry_dir` (default `project-registry`). The format:
+
+```toml
+id = "webcodex"
+path = "/srv/webcodex/projects/webcodex"
+name = "WebCodex"
+kind = "repo"
+allow_patch = true
+```
+
+`id` and `path` are the important fields; `kind` is optional descriptive metadata.
+The registry directory is storage for Project records, not a workspace root.
+
+New configurations and default discovery use only `project-registry/` and `project_registry_dir`. WebCodex 0.5 does not automatically select a historical `projects.d/` directory, and the retired `projects_dir` config field is rejected with migration guidance. Move or explicitly recreate required registration records under the canonical registry before upgrading. The old `--projects-dir` CLI flag remains retired; use `--project-registry-dir` for explicit CLI selection.
+Runtime Project ids take the canonical shape `agent:<client_id>:<project_id>`, for example `agent:workstation:my-repo`. That canonical identity remains the authorization, persistence, audit, Runner-routing, diagnostic, API and CLI address. Model-facing bootstrap/discovery may additionally return a short Server-issued `project_ref` such as `~p1`. Models should normally reuse that selector on later Project-scoped tool calls instead of copying the canonical id. The mapping is durable and scoped to the authenticated caller, is pinned to the canonical id plus Runner-reported Project root identity, and grants no authority: every use re-runs current Project visibility/authorization. It never depends on Workflow Session, ClientWindow, MCP session, transport connection, recent activity or hidden Host state, and a stale ref is never silently rebound to another Project.
+
+### Allowed roots
+
+`allowed_roots` in the Runner policy controls where projects may be registered
+or created:
+
+- Missing or empty `allowed_roots` defaults to `$HOME`.
+- An explicit `allowed_roots` overrides that default.
+- Use explicit roots to narrow a Runner to one workspace tree, for example:
+
+```toml
+[policy]
+allow_cwd_anywhere = false
+allowed_roots = ["/root/git"]
+```
+
+Managed-worktree bootstrap uses the same boundary. The Runner may derive a
+private managed namespace so the model never supplies a destination path, but
+that namespace and the resulting Project still have to fit the effective
+`allowed_roots` policy (unless `allow_cwd_anywhere=true`). A Project selector or
+Project ref does not widen this filesystem authority.
+
+### Registering projects at runtime
+
+The runtime tools `register_project` and `create_project` let a client register
+an existing directory or create a new one on an online Runner, subject to the
+Runner's `allowed_roots` policy.
+
+## Skill sources
+
+`list_skills` presents one catalog while preserving three distinct ownership and
+lifecycle models:
+
+**Available since v0.4.2:** configured live Runner Skill roots and the Managed Runner Skill Store participate in this unified catalog. WebCodex v0.4.1 `list_skills` did not implicitly scan `~/.codex/skills`; configure `[skills].roots` explicitly on v0.4.2+ when that directory should participate.
+
+| Source | Location / owner | Trust | Version semantics |
+| --- | --- | --- | --- |
+| Project Skills | `<project>/.agents/skills/<package>/SKILL.md` | `project_content` | Live project content; no package revision. |
+| Configured live Runner Skill roots | Operator-selected absolute directories on the Runner host | `operator_configured_guidance` | Live filesystem content that WebCodex does not modify; supported scripts may execute through `run_skill_resource`; no install, activation, rollback, or package revision. |
+| Managed Runner Skill Store | Runner state under `runner-skills-v1` | `operator_installed_guidance` | Immutable package revisions with install, activation, removal, and rollback-oriented Store semantics. |
+
+`skill_list.sources` always reports these three logical sources with bounded `status`, counts, truncation, and safe reason codes. An available source with `skill_count=0` means discovery succeeded and found no Skills; it is not an index failure. Only the Project source exposes the logical root hint `.agents/skills`; native configured Runner paths remain private.
+
+Configured live roots are optional and have no implicit defaults. Each configured
+root contains normal Agent Skill packages directly:
+
+```toml
+[skills]
+roots = [
+    "/home/alice/.codex/skills",
+    "/home/alice/.agents/skills",
+    "/opt/company/agent-skills",
+]
+```
+
+On Windows, use absolute local paths; TOML literal strings are convenient for
+backslashes:
+
+```toml
+[skills]
+roots = [
+    'C:\Users\alice\.codex\skills',
+    'C:\Users\alice\.agents\skills',
+]
+```
+
+A root has the form `<root>/<package>/SKILL.md`, with optional package resources
+such as `references/` and `scripts/`. These directories are read directly by the
+Runner. WebCodex does not modify files in configured roots or copy them into the
+managed Store; `install_skill`, `activate_skill`, and `remove_skill_revision`
+continue to mutate only that Store. This non-mutating behavior does not make the
+source non-executable: `run_skill_resource` may execute supported `scripts/*.py`
+or `scripts/*.sh` from an operator-configured trusted Skill.
+
+The configured paths belong to the **Runner host**, even when the Server is on a
+different machine, and selecting them is an explicit operator trust decision for
+the narrow Skill runtime. They are not added to `[policy].allowed_roots`, do not
+grant ordinary Project file/shell/process tools access to those directories, and
+native root paths are not projected through the model-facing Skill catalog. Skill
+reads and `run_skill_resource` accept only an opaque `skill_id` plus a
+package-relative resource path; the Runner resolves the root from its trusted
+configuration and rejects traversal or link escapes.
+
+Skill files remain live: editing `SKILL.md` or a resource is visible to the next
+discovery/read without any reload. For configured Skills,
+`expected_definition_revision` fences the `SKILL.md` definition, not the resource
+bytes: `run_skill_resource` re-reads the selected script at execution and returns
+`skill_sha256` for the actual bytes executed. Managed installed Skills additionally
+use `expected_package_revision` to fence the immutable package. Changing the
+configured `roots` list is a hot-reloadable Runner configuration change: edit
+`runner.toml`, run `check_runner_config`, then `reload_runner_config` with the
+current generation. No Runner process restart is required.
+
+## Runner build identity
+
+A connected Runner reports bounded, non-secret binary identity through `get_runtime_status(client_id=...)` and `list_runners`: package version, Git commit/dirty state, build timestamp, Cargo target triple, and architecture. Older Runners may omit any of these optional fields. This is intended for deployment/source-alignment diagnostics; executable paths, environment, tokens, and credentials are not included. `webcodex-runner --version` remains the local pre-connection identity check.
+
+## Runner-level configured instructions
+
+A Runner can project the same coding guidance into every Project bootstrap on that
+Runner. v1 is configured manually in the Runner's `runner.toml`; Desktop file
+selection/upload UI is intentionally deferred.
+
+```toml
+[instructions]
+files = [
+    "/home/alice/.codex/AGENTS.md",
+]
+```
+
+On macOS use the equivalent Runner-local absolute path such as
+`/Users/alice/.codex/AGENTS.md`. On Windows, TOML literal strings avoid escaping
+backslashes:
+
+```toml
+[instructions]
+files = [
+    'C:\Users\alice\.codex\AGENTS.md',
+]
+```
+
+There is no implicit `~/.codex/AGENTS.md` discovery. Each configured path is
+absolute and Runner-local. At coding startup, Runner-configured sources are
+projected first in deterministic config order, followed by the existing
+project-local candidates (`AGENTS.md`, `agents.md`, `CLAUDE.md`,
+`.codex/AGENTS.md`, `.github/copilot-instructions.md`). Both classes are model
+guidance only; neither changes execution authority.
+
+Configured instruction files are read by a narrow Runner-owned instruction
+runtime. Their parent directories are **not** added to `[policy].allowed_roots`,
+ordinary Project file/shell/process tools do not gain access to them, and native
+absolute paths are not projected to the model. Model-facing sources use sanitized
+logical identities instead.
+
+Configured sources must be ordinary UTF-8 files, at most 1 MiB each. The file and
+its parent components must not be symbolic links or Windows reparse points
+(including directory junctions); configure the resolved physical path instead.
+Parent traversal is handle-relative on Unix and preserves search-only directory
+semantics where the platform exposes them. On Windows, the parent path is
+acquired with a native no-reparse open and the leaf is opened relative to that
+pinned parent handle; the parent identity is rechecked before accepting the
+observation, so a concurrent parent replacement cannot retarget the configured
+read. Non-Unix/non-Windows targets fail closed instead of falling back to a
+path-based open. Windows verbatim disk/UNC paths remain accepted, but remote filesystems
+depend on their server-side reparse and handle semantics and should not be
+treated as providing stronger guarantees than the remote server implements.
+The reader checks the opened file handle and enforces the byte bound during
+reading, not only through a prior metadata check. Unreadable, redirected, oversized, or invalid-UTF-8
+sources make the instruction scan incomplete without exposing their native paths
+or failing the entire Project bootstrap.
+
+Changing `[instructions].files` is hot-reloadable: edit `runner.toml`, run
+`check_runner_config`, then `reload_runner_config` with the current generation.
+No Runner restart is required. The files themselves remain live: editing a
+configured `AGENTS.md` is visible to the next `work_on_project`/new Project
+bootstrap without any config reload. Each Project bootstrap observes the current
+Runner-global instructions independently; v1 does not retain or suppress them
+across Projects. Truncated Runner-global sources stay bounded and do not create a
+generic arbitrary-file `read_more` authority.
+
+
+An empty configured file or a missing leaf beneath verified ordinary parent
+directories confirms removal. A missing, redirected, or unreadable parent leaves
+the Runner scope unavailable, as do other read failures. Removing an entry from
+`instructions.files` remains an explicit revocation after config reload.
+An explicit Session resume refreshes Runner and
+Project scopes independently, retaining an unavailable scope's last-known rules
+only in memory. A newly observed Runner instance or config generation cannot
+inherit the previous global rules. Within one instance, a higher known config
+generation wins regardless of request start order; an unknown generation cannot
+replace a known generation. Instance replacement uses live-instance verification
+order, so a late retired-instance observation cannot restore old guidance.
+Within one instance/generation, request observation order breaks ties. Project
+reads have their own start-order fence, independent of Runner availability;
+late Project observations retain newer local rules and report an incomplete
+scan. Retention is scope-wide, not per-file within an incomplete scope.
+Instruction bodies and observation fences are not persisted.
+
+Project-local text reserves its share of the 32 Ki-character snapshot before
+global text is shortened; presentation remains global-before-project. Session
+retention selects scopes before applying this shared budget. An independently
+bounded global source copy (at most 32 Ki characters) stays only in Session
+memory, so retaining a short Project scope or later shrinking it can recover
+global text hidden by an earlier aggregate budget. This source copy and all
+observation fences are omitted from public snapshots and summaries. Runner
+sources never receive a Project `read_file` continuation, including during final
+startup byte-budget reduction. `work_on_project` always re-observes instructions
+and change metadata while keeping instruction bodies out of its primary output.
+An explicit `context_request=["project.instructions"]` observes current Runner
+and Project sources together and projects their bounded bodies without reusing
+Session-retained bodies. The instruction
+projection fits the remaining 20 KiB shared sidecar envelope by dropping derived
+headings before shortening text, preserving source identities and Project rules
+instead of discarding the entire material solely because global sources were added.
+
+## ACP coding agents: explicit startup environment
+
+ACP agents are configured at Runner startup and receive a cleared environment
+(`env_clear()`), followed only by explicit `env_from_env` mappings. For an
+already installed npm `codex-acp` adapter, use the absolute installed executable
+and explicitly opt into its runtime environment, for example:
+
+```toml
+[acp]
+max_concurrent_runs = 1
+
+[[acp.agents]]
+id = "codex"
+name = "Codex"
+executable = "/absolute/path/to/codex-acp"
+args = []
+env_from_env = { PATH = "PATH", HOME = "HOME" }
+```
+
+The Runner's own `PATH` must contain the real Node executable. Homebrew or NVM
+installations may live outside default executable search directories; mapping
+`PATH` cannot repair an incomplete Runner environment. Start Runner with the
+required environment and restart it after configuration or environment changes.
+The Desktop editor offers an explicit **Add missing PATH/HOME mappings** action;
+it adds names only when selected and preserves existing source mappings.
+
+`PATH` and `HOME` are a starting point, not a guarantee of a complete environment.
+Explicitly map `HOME` for the required user configuration/authentication state;
+map `CODEX_HOME` if using a custom Codex home, and proxy/certificate variables
+such as `HTTPS_PROXY`, `SSL_CERT_FILE`, or `NODE_EXTRA_CA_CERTS` only as needed.
+Each mapped source must exist in Runner's environment; a missing source fails
+before agent launch. Mapping private state or credentials delegates access to the
+configured agent. Values remain outside Desktop configuration and Server
+advertisements.
+
+The npm adapter normally uses its bundled Codex, which is distinct from a
+system `codex` command. To select another Codex with `CODEX_PATH`, explicitly
+map `CODEX_PATH = "CODEX_PATH"` and provide that source in Runner's environment.
+
+A Linux equivalent reproduction with `codex-acp` **2.1.1** and its bundled Codex
+**0.159.3** exited with status **127** before ACP `initialize` when `PATH` was
+absent; explicitly mapping a Runner `PATH` containing Node allowed
+initialization. This does not establish the original reporter's environment or
+validate macOS; it is not evidence that every startup failure is resolved.
+See the [ACP run contract](agent/acp-coding-agent-run.md#6-runner-owned-acp-provider-configuration)
+for lifecycle and configuration boundaries.
+
+## Local MCP providers
+
+The Runner can directly host persistent stdio MCP providers for WebCodex's built-in MCP gateway:
+
+```toml
+[mcp]
+request_timeout_secs = 30
+max_tool_description_bytes = 65536 # Default: 64 KiB
+
+[[mcp.providers]]
+id = "github"
+name = "GitHub"
+executable = "/absolute/path/to/github-mcp-server"
+args = []
+cwd = "/absolute/provider/workdir"
+env_from_env = { GITHUB_TOKEN = "GITHUB_TOKEN", PATH = "PATH", HOME = "HOME" }
+timeout_secs = 30
+```
+
+`max_tool_description_bytes` is a Runner-owned, operator-configurable per-tool `description` admission limit (default 65,536 bytes; accepted range 4,096–262,144 bytes). It applies to both `tools/list` and the schema preflight before `tools/call`. The Server still enforces the fixed 256 KiB per-description protocol hard cap, 1 MiB whole `tools/list` message cap, and the existing schema/tool-count bounds. Set this in the Runner's `[mcp]` section; a generation-fenced Runner config reload applies it without restarting unchanged providers. This does not truncate third-party descriptions or expand model-facing budgets.
+
+`executable` and optional `cwd` must be absolute host-local operator configuration. Invalid paths fail closed. `[mcp]` participates in the normal generation-fenced Runner config reload transaction: unchanged providers keep their exact provider identity and live connection, changed providers receive a fresh provider identity, and added/removed providers update routing without restarting the Runner. Old exact provider identities fail closed and are never retargeted.
+
+Provider processes do not inherit the Runner environment wholesale. `env_from_env` copies only explicitly named variables, and WebCodex's own sensitive transport/account credential variables cannot be mapped. A missing configured source variable fails before provider start. On Windows, the Runner additionally supplies only the non-secret `SYSTEMROOT` OS bootstrap after clearing the environment, unless that destination is explicitly mapped; `PATH`, user-profile state, proxies, and credentials are still not inherited.
+
+Mapping a credential delegates that credential to the configured provider process. The provider can use it according to its own implementation and can choose to return derived or raw values through normal tool results; WebCodex does not attempt to redact arbitrary provider output. Treat configured providers as credential recipients, use least-privilege provider credentials, and remember that any caller authorized for `mcp:local` can exercise the provider capabilities that those credentials enable.
+
+A provider connection starts on first real interaction and is reused while healthy. A fatal stdio/protocol failure retires only that connection; WebCodex never replays the failed request. A later explicit request may start a fresh connection under the same logical provider identity, and an effectful `tools/call` re-lists and checks the bound tool schema before dispatch. The Server sees the logical provider `id`/`name`, not its executable path, environment values, PID, stderr, or Runner credential. `mcp_tool(action=list)` reports only routing resolvability. `mcp_tool(action=status, server=...)` is a passive Runner-side lifecycle observation that never starts, initializes, or pings a provider; it reports only `never_started`, `healthy`, `connection_retired`, or `busy`. Here `healthy` means the retained connection's child process is still running, not that an end-to-end MCP health probe was performed. `list(server=...)` and `describe` interact with the provider.
+
+### Provider-side gateway V1 compatibility
+
+The built-in Runner-to-provider gateway is intentionally a bounded stdio tool subset, not a transparent bridge to every MCP feature:
+
+- provider-side tool behavior is based on MCP `2025-06-18`;
+- `tools/list` and `tools/call` are supported;
+- callbacks, list pagination, and end-to-end progress forwarding are not supported;
+- tool results support text plus standard bounded image content blocks, preserving provider content order; image data must be standard Base64 with MIME `image/png`, `image/jpeg`, or `image/webp`, and all image blocks in one result share a 4 MiB decoded-data cap;
+- bounded `structuredContent` is preserved independently of image content;
+- audio, resource, `resource_link`, and unknown content block types remain unsupported.
+
+Unsupported protocol/content shapes fail closed instead of being silently translated. This remains a bounded MCP tool subset, not a transparent media/resource bridge.
+
+## Shell profiles
+
+Ordinary project shell/process execution defaults to `[shell] environment_mode =
+"inherit"`: PATH, HOME/USERPROFILE and toolchain variables come from the process
+that started the Runner. WebCodex transport/account credentials are filtered.
+Shell `env` overrides inherited values; profile `env` overrides shell `env`.
+Profiles cache this environment per project/config generation. An explicit
+`init_script` can modify the snapshot; no startup script runs otherwise.
+
+Set `environment_mode = "isolated"` for a minimal environment: `/usr/bin:/bin` on
+Unix, or SystemRoot and its System32 PATH on Windows, plus configured env and
+path_prepend. This is environment isolation, not a filesystem sandbox.
+WebCodex does not automatically source `~/.bashrc` or `~/.profile`.
+Configured MCP credential delegation remains explicit; this setting does not
+expand its `env_from_env` allowlist. Native Plugins continue to use the existing
+filtered shell/profile environment and native-only executable contract.
+
+Windows `run_process` and `run_detached_process` accept `.cmd`/`.bat` shims through
+Runner-owned `cmd.exe /d /s /v:off /c` conversion. Each argument is quoted; spaces,
+empty arguments, `&`, `|`, and parentheses are supported. Quotes, `%`, `!`, `^`,
+control characters and trailing backslashes are rejected before startup. The
+command is bounded to 8000 UTF-16 units. Batch shims require a local drive cwd;
+UNC cwd is rejected before spawn because cmd.exe cannot preserve it. Use a native runtime executable when
+arguments fall outside this contract. Batch scripts remain responsible for how
+they handle their own arguments (for example, forwarding with `%*`). Process
+ownership, stdin, cwd, timeout, cancellation and detached reconciliation are
+unchanged; a rejected argument never starts a Job payload.
+
+Structured exact reads can inspect `node_modules` and `target`; recursive
+search/listing skip those trees. Structured edits still reject generated trees.
+Credentials, `.env*`, Runner configuration and `.git` control data remain protected
+for both reads and writes.
+
+Example Rust/Cargo profile in `runner.toml`:
+
+```toml
+[shell]
+default_profile = "rust"
+
+[shell.profiles.rust]
+program = "sh"
+args = ["-c"]
+
+[shell.profiles.rust.env]
+PATH = "/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+CARGO_HOME = "/root/.cargo"
+RUSTUP_HOME = "/root/.rustup"
+```
+
+Example Python venv profile:
+
+```toml
+[shell.profiles.py-venv]
+program = "bash"
+args = ["-lc"]
+init_script = '''
+source .venv/bin/activate
+'''
+```
+
+The `init_script` is project-relative: it is resolved from the project root,
+so each project activates its own venv. A project can pin a profile:
+
+```toml
+id = "paper-exp"
+path = "/root/git/paper-exp"
+shell_profile = "conda-ml"
+```
+
+Resolution order: `project.shell_profile`, then `shell.default_profile`, then
+the plain shell config (no snapshot).
+
+`open_session_shell` is the separate long-lived shell path. On Unix it keeps a
+real `sh`/`bash` process; on Windows the local path keeps the configured
+`powershell.exe`/`pwsh.exe`-compatible process and reuses the same profile/env
+selection. Windows PowerShell shell/profile args must retain their normal final
+`-Command` flag in configuration; the persistent transport replaces that
+one-shot payload mode internally with its private bootstrap. Named SSH resources
+support `run_shell`/`run_job` on Unix and Windows through the separate `ssh_shell`
+capability. Persistent SSH requires `persistent_shell` + `ssh_persistent_shell`:
+Unix may reuse a Runner-local OpenSSH mux, while Windows owns one direct long-lived
+`ssh.exe` channel. PTY/ConPTY terminal emulation is not implied.
+
+Security notes for profiles:
+
+- Never put tokens in `init_script`, and never `echo` secrets into it — the
+  script's stdout is parsed as part of the snapshot.
+- Status and runtime APIs expose only sanitized profile metadata (name,
+  `has_init_script`, env key count, program, dialect) — never `init_script`
+  bodies or environment values.
+- Profiles run with a cleared environment plus an explicit allowlist; declare
+  the env they need.
+
+### Typed `run_script` languages
+
+`run_script` accepts `sh`, `bash`, `powershell`, `javascript`, and `typescript`.
+JavaScript and TypeScript are external Node.js execution on the Runner. WebCodex
+resolves `node` from the prepared shell/profile PATH (or uses the configured
+shell/profile program when it is `node`/`node.exe`). JavaScript bodies are
+written to Runner-owned `.mjs` files and launched as
+`node <temporary.mjs> <args...>` with native argv. `.mjs` fixes ESM semantics
+independently of project `package.json` or temporary-directory metadata.
+
+TypeScript is deliberately a typed-script runtime, not a project compiler. The
+Runner writes the body to a Runner-owned `.mts` file, so the entry module is
+always ESM, and uses Node's native erasable type stripping. Node.js 22.6.0 is
+the minimum supported runtime. Before creating or starting the user script, the
+Runner performs one bounded `node --version` capability probe. Node 22.6 through
+22.17 and Node 23.0 through 23.5 receive the Runner-owned
+`--experimental-strip-types` prefix; Node 22.18+, 23.6+, and later supported
+lines use the default native stripping behavior without that flag. A missing
+Node, an unrecognizable version, or Node older than 22.6 is reported as
+`not_started` / `interpreter_unavailable`, and the user script is never launched.
+If Node accepts the version probe but the eventual script process rejects its
+runtime semantics, the ordinary started-process lifecycle remains authoritative.
+
+The TypeScript contract covers syntax that Node can erase, including type
+annotations, interfaces/type aliases, generics, and ordinary JavaScript features
+such as async/await, ESM, and Node built-ins. WebCodex does not type-check, invoke
+`tsc`, consume `tsconfig.json` as a build configuration, implement path aliases,
+or promise transform-required TypeScript syntax such as enums, parameter
+properties, runtime namespaces, or import aliases. WebCodex also does not use
+`--experimental-transform-types`: that flag is not part of the stable runtime
+contract. On older Node versions that still mark type stripping experimental,
+Node's own `ExperimentalWarning` may appear on stderr. WebCodex does not suppress
+or filter that warning because doing so could also hide warnings emitted by the
+user script.
+
+For rolling upgrades, JavaScript requires the additive
+`structured_script_javascript` capability and TypeScript independently requires
+`structured_script_typescript`. These bits mean the running Runner binary
+understands the corresponding typed-script wire semantics; they do not assert
+that a compatible Node installation is present. Script args remain literal
+native argv values, stdin remains independent, and both languages use the same
+resolved project cwd, timeout/cancellation, Runner policy, and Job lifecycle as
+other typed scripts.
+
+WebCodex does not install or bootstrap npm dependencies, inject `node_modules`
+or `NODE_PATH`, select a package manager, or fall back to Bun, Deno, `tsx`,
+`npx`, or another runtime. Because the `.mjs`/`.mts` entry lives in a Runner-owned
+temporary directory, relative ESM imports resolve from that temporary module,
+not from the project cwd; use Node built-ins or explicit project paths/file URLs
+when importing project code.
+
+## Jobs and concurrency
+
+A Job is a long-running command or validation that continues after the
+initiating call returns. Jobs have a stable `job_id`, bounded stdout/stderr
+tails, and can be stopped. Structured execution (`run_process`,
+`run_script`) and validation Jobs hand off a single execution to a Job when it
+outlives the synchronous grace period; the same process continues — it is never
+restarted.
+
+The Runner executes up to `max_concurrent_jobs` Jobs at once (default 4, valid
+range 1..64). Values outside that range are rejected as configuration errors.
+This is an operational tuning control, not a security boundary, and requires a
+Runner restart to change:
+
+```toml
+max_concurrent_jobs = 4
+```
+
+When all slots are occupied, an accepted Job remains the same queryable Job
+with the same `job_id` and reports `agent_queued`.
+
+## Transports in more detail
+
+### Server requirements for QUIC
+
+Enable the QUIC listener on the Server and open the chosen UDP port:
+
+```sh
+WEBCODEX_QUIC_ENABLED=true
+WEBCODEX_QUIC_LISTEN=0.0.0.0:8443
+WEBCODEX_QUIC_CERT=/etc/letsencrypt/live/<host>/fullchain.pem
+WEBCODEX_QUIC_KEY=/etc/letsencrypt/live/<host>/privkey.pem
+WEBCODEX_QUIC_ALPN=webcodex-runner/1
+```
+
+The certificate SAN must match the `server_name` configured on the Runner.
+`auto` tries QUIC first when `[quic]` is present, then WebSocket, then polling.
+
+`[quic].keepalive_interval_secs` controls Quinn's transport-level UDP/QUIC
+keepalive. It defaults to 20 seconds and accepts 1 through 25 seconds; values
+outside that range are rejected rather than clamped. This is separate from
+WebCodex application `Ping`/`Pong` liveness, which remains on its own 30-second
+cadence. QUIC connects directly over UDP and does not use the Runner's HTTP
+proxy settings.
+
+### Outbound proxy for the Runner
+
+If the Runner host needs an outbound HTTP proxy, set the proxy variables in
+the Runner's service environment, not only in an interactive shell. WebSocket
+honors `HTTPS_PROXY`/`https_proxy`, then `HTTP_PROXY`/`http_proxy`, then
+`ALL_PROXY`/`all_proxy`; `NO_PROXY`/`no_proxy` bypasses matching hosts. The
+supported proxy transport is `http://host:port` via HTTP `CONNECT`. QUIC does
+not use proxy settings.
+
+## Reconnect and recovery
+
+A Runner disconnect is a liveness fact, not a lost-work fact. Accepted active
+Jobs enter a bounded `recovering` state (default grace 120 seconds) and are
+restored from the Runner's inventory when the same Runner instance reconnects.
+Ordinary Jobs remain owned by that exact Runner process: a replacement instance
+does not inherit their child processes, so they become `lost`. Explicit
+`run_detached_process` Jobs are different: after a one-shot durable ownership
+handoff, a narrow supervisor owns the payload tree. If that exact supervisor and
+its fenced execution identity remain live, a replacement Runner can reconstruct
+the same logical detached Job and route observation or stop through its durable
+control state. This does not make ordinary process execution detachable, and it
+does not promise survival across a machine reboot.
+
+Completed caller-visible ordinary Jobs have a separate Server-owned SQLite
+receipt. Within the original 15-minute terminal retention window, up to 64
+receipts per logical Runner survive a coordinated Server/Runner restart and
+remain available through `list_jobs`, `observe_jobs`, and bounded log reads.
+Receipts preserve the Job id, terminal result, retained log cursors and tails,
+and original authorization partition/owner; Runner registration is not required
+to observe them. Restarts and receipt replay do not renew their deadlines.
+Storage failure degrades restart observability without changing execution success.
+
+These receipts are read-only evidence. They contain no command input, stdin,
+environment, validation argv, replay intent, process handle, or execution lease.
+Active ordinary Jobs remain process-owned; only `run_detached_process` has an
+explicit durable execution ownership handoff. Hidden synchronous results and
+detached ownership state are excluded from ordinary receipt persistence.
+
+The Server distinguishes the stable Runner `client_id` from the current live process lease. A stale or replacement process cannot keep submitting results under the old lease, and ordinary child-process Jobs are not adopted by a replacement Runner. The exact lease identifier is an internal wire detail.
+
+Reconnect happens automatically with a short delay. In `auto` mode, polling is
+not a permanent downgrade: after 30 seconds the Runner retries its preferred
+stream plan (configured QUIC, then WebSocket) at a safe request boundary. Busy
+HTTP dispatches defer promotion while polling continues; already-running Jobs
+are not drained or restarted. Failed stream attempts return to polling. Network
+and registration timeouts/backoff also contribute to recovery latency, so 30
+seconds is a retry interval, not an end-to-end recovery deadline. Explicit
+`polling` remains polling, and explicit `websocket` keeps retrying WebSocket.
+
+Runner admission and Server inventory validation share the same semantic shell
+identities, including `python` (not concrete executables such as `python3`).
+Ordinary Job start/end timestamps are clamped to their causal predecessors:
+`started_at >= created_at` and `ended_at >= started_at` (or `created_at` before
+execution). This covers immediate admission rejection as well as completion;
+execution duration remains independently measured. Clock skew must not make a
+normal retained Job inventory invalid after an otherwise successful execution.
+
+The exact registration metadata errors `job inventory shell is invalid` and
+`job inventory timestamps are inconsistent` retain the same Runner instance and
+intact Job inventory and retry with bounded backoff. Persistent rejection still
+requires investigation or a corrected peer; retries do not declare recovery
+successful. The Runner never clears active inventory to obtain registration.
+Authentication, identity/ownership, unsupported protocol and other fatal errors
+still stop the Runner. Keep an operating-system supervisor enabled as a safety
+net, but restarting a Runner is not a substitute for same-process Job recovery.
+
+Do not launch a supposedly permanent Runner watchdog using `nohup ... &` inside
+an ordinary `run_shell` Job. Ordinary execution owns and cleans up its process
+tree when the parent command exits; backgrounding and redirecting output do not
+transfer that ownership. Install the Runner/watchdog through a service manager
+outside the Runner-owned Job tree. `run_detached_process` is a separate bounded
+native-execution contract, not an unbounded shell-service installer.
+
+Server-only restart recovery and durable execution are distinct. Active ordinary
+Jobs are reconstructed from the live Runner inventory; a Server-side pending
+request, a historical receipt, or a durable Workflow Session is not a durable
+execution queue or permission to replay a command. The restart acceptance harness
+covers running work, offline completion, `run_process`, Python `run_script`,
+validation handoff, original Job identity, log continuity and exactly-once
+fixture side effects:
+
+```sh
+E2E_RUNNER_TRANSPORT=auto E2E_TIMEOUT_SECS=900 bash scripts/e2e_job_reconciliation_ws.sh
+```
+
+The harness uses isolated ports, tokens, directories and processes and builds
+with the `dogfood` profile by default. It does not restart deployed services.
+
+## Shutting down and restarting
+
+`webcodex-runner` stops cleanly on `SIGINT`/`SIGTERM`. It does not daemonize
+itself. For a supervised deployment, use `webcodex runner install --scope
+user|system` to install and supervise it as a user or system service, and keep
+the token in the service environment.
+
+After a machine reboot, a hosted `connect` profile is restarted by rerunning
+`webcodex connect` or `webcodex runner start --profile <profile>`. Automatic
+startup at logon is not implemented for hosted profiles.
+
+On Windows, each Runner process also writes one small bounded lifecycle record under
+`%LOCALAPPDATA%\webcodex\runner-exit-diagnostics-v1\<runner-hash>\` (falling
+back to `%USERPROFILE%\.local\state\webcodex` and then `%TEMP%\webcodex` through
+the normal Runner state-path rules). Only the newest eight process records are
+retained. A record contains the local PID, process start time, build identity,
+transport, shutdown-signal observation, transport return class, and clean/fatal
+terminal classification. A sibling `*.panic.json` file is written best-effort
+when a Rust panic hook runs and contains only the thread name and source location;
+it never stores the panic payload. These diagnostics never contain credentials,
+commands, Job output, request payloads, or Server response bodies, and a state
+write failure never changes Runner lifecycle behavior.
+
+For an unexpected supervised exit, correlate the supervisor's PID/timestamp with
+the matching lifecycle record. `terminal=null` means the process disappeared
+before Rust recorded a clean/fatal return. A panic sibling narrows that to a Rust
+panic; `shutdown_signal_received_at_unix_ms` without a terminal record points to
+an interrupted graceful-shutdown path. If neither is present, investigate an
+external/native process termination or supervisor action before adding broader
+Runner telemetry.
+
+## SSH session resources (advanced)
+
+A Runner with an available local OpenSSH client advertises the `ssh_shell`
+capability. A Workflow Session may select a named SSH resource so `run_shell`
+and `run_job` execute on a remote host through the Runner's own OpenSSH client
+on both Unix and Windows. Unix may reuse a Runner-local ControlMaster transport;
+Windows starts one direct `ssh.exe` process per one-shot/background execution and
+does not use `ControlMaster`, `ControlPersist`, or `-S`. The separate
+`ssh_persistent_shell` capability allows the same resource to be used by
+`open_session_shell`: Unix may reuse its mux, while Windows owns one direct
+long-lived `ssh.exe` channel.
+
+```toml
+[ssh.resources.tmp]
+host = "tmp"
+default_cwd = "/opt/webcodex-edge"
+```
+
+The `host` value is passed to the Runner machine's OpenSSH client, so normal
+`~/.ssh/config`, keys, `ssh-agent`, and `ProxyJump` configuration remain on
+that machine. Do not put credentials, private keys, or complete SSH
+configuration into session data, Server storage, or tool input. A Session's
+`execution_context.resource` routes `run_shell`, `run_job`, and supported
+`open_session_shell` calls through that resource; file, Git, and LSP tools
+remain local. Configuration reloads bind future commands to the current resource
+generation; already-started SSH commands keep their own bounded lifecycle and
+are never redirected, replayed, or blindly retried.
+
+Authorized model clients can also onboard Runner-local SSH resources with the
+`manage_ssh_resource` MCP tool. `list` returns only safe logical names plus
+`static|managed`, active/pending-restart state, and an opaque exact-Runner /
+registry-revision binding. `register` accepts one explicit OpenSSH destination
+argv and optional default cwd; `remove` deletes only managed desired state.
+Raw targets, usernames, addresses, SSH options, credentials, and identity paths
+are never returned by the tool. Static `[ssh.resources.*]` names are reserved
+and cannot be overwritten or removed through this path.
+
+Managed mutations are durable desired-state changes, not live configuration
+edits. When a mutation returns `restart_required=true`, restart that Runner,
+then `list` again before binding the resource into a Workflow Session. An
+idempotent operation already aligned with the frozen startup snapshot may
+return `restart_required=false`. Access is separately gated by the optional
+`ssh:local` permission; hosted OAuth clients opt in with
+`webcodex connect ... --oauth-local-ssh`.
+
+The managed target is still consumed by the existing SSH transport. In
+particular, registering a Windows OpenSSH destination does not imply that
+PersistentShell can start there: the current remote persistent-shell contract
+requires the existing remote `sh`/`bash` path. Remote PowerShell PersistentShell
+is not part of this capability.
+
+## LSP navigation (read-only)
+
+The Runner can serve read-only semantic navigation through language servers
+run on the repository machine:
+
+| Language | Server | Markers |
+| --- | --- | --- |
+| Rust | `rust-analyzer` | `Cargo.toml` |
+| Go | `gopls` | `go.mod`, `go.work` |
+| Python | `pyright` | `pyproject.toml`, `setup.py`, `requirements.txt`, … |
+| TypeScript / JavaScript | `typescript-language-server` | `tsconfig.json`, `package.json`, … |
+
+The tools are `get_lsp_status`, `list_document_symbols`, `find_definition`,
+`find_references`, `read_document_diagnostics`, `hover`, and `list_workspace_symbols`.
+The distinct `read_call_hierarchy` operation performs prepare plus bounded
+incoming/outgoing breadth-first traversal inside the Runner. The canonical
+Connector projects it as `code_impact`; raw protocol methods and opaque LSP
+item data are never exposed.
+They are read-only, project-bound, and constrained so that starting a language
+server never executes repository code or fetches dependencies. Paths are
+project-relative; external/dependency locations are omitted. Servers must be
+installed on the Runner machine or pointed to by env overrides such as
+`WEBCODEX_RUST_ANALYZER` and `WEBCODEX_GOPLS`. The gopls profile also forces
+module/toolchain network access off and uses `-mod=readonly`; WebCodex never
+installs gopls or fetches missing Go dependencies for semantic navigation.
+
+Call hierarchy requires the separately advertised `lsp_call_hierarchy`
+capability and the selected server's `callHierarchyProvider`. Missing support
+fails explicitly without grep, AST, shell, or reference fallback.
+
+## Operating the Runner
+
+Minimal commands:
+
+```bash
+webcodex runner status --profile <profile>
+webcodex runner logs --profile <profile> --lines 100
+webcodex runner restart --profile <profile>
+```
+
+For a user service:
+
+```bash
+webcodex runner install --scope user --config <login-reported-runner-config>
+webcodex runner status --scope user --config <login-reported-runner-config>
+```
+
+For an administrator-managed system service:
+
+```bash
+sudo webcodex runner install --scope system --profile <profile> \
+  --user <runner-user> --working-directory /home/<runner-user>
+sudo webcodex runner status --scope system --profile <profile>
+```
+
+Use the same `--scope` for install, status, start, stop, restart, logs, and
+uninstall. User scope uses `systemctl --user`; system scope uses
+`/etc/systemd/system`.
+
+For an already-running Runner, use the first-class configuration workflow instead
+of finding its PID or sending signals manually:
+
+1. Edit the Runner's existing startup-bound `runner.toml`.
+2. Call `check_runner_config(client_id=...)`. It reads only that bound path, does
+   not activate the candidate, and returns the current generation plus bounded
+   validation/restart metadata.
+3. If valid, call
+   `reload_runner_config(client_id=..., expected_generation=<current_generation>)`.
+   The optimistic generation fence rejects stale callers before activation.
+4. Inspect `get_runtime_status(client_id=...)` (or `list_runners`) after reload.
+
+`reload_runner_config` never writes `runner.toml`; it only activates the candidate
+already on disk. Hot-reloadable policy, shell, configured Skill roots, configured
+instruction files, Native Plugin, and static SSH-resource changes can become active
+immediately, while fields reported in `restart_required_fields`
+remain startup-only until the Runner restarts. Invalid candidates leave the active
+snapshot and generation unchanged. Managed `manage_ssh_resource` mutations are different:
+they use a frozen startup snapshot and require a Runner restart exactly when the
+tool reports `restart_required=true`.
+
+Plugin configuration is live-applied through the same validated Plugin candidate
+admission/commit primitive used by `plugin_tool reload`; changing `[plugins]` is
+not a restart-only operation. `plugin_tool reload` remains the narrower
+`plugin:manage`-scoped entry when only Plugin state should be reloaded.
+
+On Unix, service reload/SIGHUP remains an optional compatibility trigger and calls
+the same authoritative reload primitive. Windows and macOS use the first-class
+operation directly; no signal emulation or PID management is required. When a
+validation failure is safely classifiable, config operations report only closed
+non-secret atoms such as `field=max_concurrent_jobs` and `reason=out_of_range`;
+raw TOML, configured values, paths, credentials, parser text, and shell environment
+values are not projected.

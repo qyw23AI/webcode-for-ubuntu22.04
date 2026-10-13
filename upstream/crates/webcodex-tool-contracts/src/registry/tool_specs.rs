@@ -1,0 +1,735 @@
+use crate::input_schema_for_tool;
+#[cfg(test)]
+use serde_json::Value;
+
+mod memory;
+mod skills;
+
+use super::super::tool_catalog::EXACT_MANIFEST_SPECIALIST_TOOL_NAMES;
+use super::super::tool_definition::{
+    lookup_tool_definition, model_visible_tool_definitions, runtime_tool_operator_extension_family,
+    ToolDefinition, ToolOperatorExtensionFamily,
+};
+use super::super::tool_spec::ToolSpec;
+use super::{output_schema_for_tool, tool_annotations};
+use std::collections::BTreeSet;
+
+/// Schema-free catalog entry. Selection and counts need metadata, not eagerly
+/// materialized input/output contracts. This record does not admit a tool.
+#[derive(Debug, Clone)]
+pub struct ToolDescriptor {
+    pub name: String,
+    pub description: String,
+    pub discovery_keywords: &'static [&'static str],
+}
+
+impl ToolDescriptor {
+    pub fn annotations(&self) -> serde_json::Value {
+        tool_annotations(&self.name)
+    }
+
+    pub fn input_schema(&self) -> serde_json::Value {
+        #[cfg(any(test, feature = "root-test-support"))]
+        MATERIALIZATIONS.with(|count| {
+            let (input, output) = count.get();
+            count.set((input + 1, output));
+        });
+        input_schema_for_tool(&self.name)
+    }
+
+    pub fn into_spec(self) -> ToolSpec {
+        let input_schema = self.input_schema();
+        #[cfg(any(test, feature = "root-test-support"))]
+        MATERIALIZATIONS.with(|count| {
+            let (input, output) = count.get();
+            count.set((input, output + 1));
+        });
+        ToolSpec {
+            input_schema,
+            output_schema: output_schema_for_tool(&self.name),
+            annotations: self.annotations(),
+            name: self.name,
+            description: self.description,
+            discovery_keywords: self.discovery_keywords,
+        }
+    }
+}
+
+#[cfg(any(test, feature = "root-test-support"))]
+thread_local! {
+    static MATERIALIZATIONS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Test-thread-local contract projection counts, not cache internals or telemetry.
+#[cfg(any(test, feature = "root-test-support"))]
+pub fn take_tool_materialization_counts_for_test() -> (usize, usize) {
+    MATERIALIZATIONS.with(|count| count.replace((0, 0)))
+}
+
+pub fn registered_tool_descriptors() -> Vec<ToolDescriptor> {
+    resolve_tool_descriptors(model_visible_tool_definitions())
+}
+
+pub fn registered_tool_specs() -> Vec<ToolSpec> {
+    registered_tool_descriptors()
+        .into_iter()
+        .map(ToolDescriptor::into_spec)
+        .collect()
+}
+
+pub fn exact_manifest_specialist_tool_descriptors() -> Vec<ToolDescriptor> {
+    resolve_tool_descriptors(EXACT_MANIFEST_SPECIALIST_TOOL_NAMES.iter().map(|name| {
+        let definition = lookup_tool_definition(name)
+            .unwrap_or_else(|| panic!("missing exact-manifest specialist definition: {name}"));
+        debug_assert!(!definition.visibility.is_model_visible());
+        definition
+    }))
+}
+
+pub fn exact_manifest_specialist_tool_specs() -> Vec<ToolSpec> {
+    exact_manifest_specialist_tool_descriptors()
+        .into_iter()
+        .map(ToolDescriptor::into_spec)
+        .collect()
+}
+
+/// Goal Plan observation/synchronization contract. The single App-only tool is
+/// explicitly effectful: Server-owned stall revalidation may atomically create
+/// one durable Attention/Wake before returning the final bounded projection.
+pub fn goal_plan_app_tool_descriptors() -> Vec<ToolDescriptor> {
+    vec![tool_descriptor(
+        "sync_goal_plan",
+        "App-only exact Goal Plan synchronization from the current Host Window. Accepts only goal_id; re-authorizes the Goal, recomputes bounded activity, and when inactivity is authoritatively eligible reuses the Server-owned Session/Window/Project/revision/request/coverage fences to atomically create at most one durable Attention/Wake per meaningful-work epoch before returning the final bounded projection. It never dispatches a Host turn directly.",
+    )]
+}
+
+/// Presentation App artifact reads; canonical definitions stay ModelHidden.
+pub fn artifact_app_tool_descriptors() -> Vec<ToolDescriptor> {
+    vec![
+        tool_descriptor(
+            "read_app_artifact_chunk",
+            "App-only generic read of one 512 KiB Host-facing segment from an exact authorized Project/path/size/SHA-256 artifact version selected by a presentation App. Rechecks Project ownership, path policy and Runner capability on every read; binary bytes use private MCP metadata only. A changed version fails closed. The segment remains below the observed ChatGPT App delivery cliff while reusing the canonical internal artifact transport, and stays format-neutral so PDF, DOCX, PPTX and other renderers can share it.",
+        ),
+    ]
+}
+
+/// Work Result App primitives. Canonical definitions stay ModelHidden; only the
+/// MCP Apps adapter projects live refresh, bounded Window collaboration, closeout
+/// sealing, and frozen lazy diff reads.
+pub fn work_result_app_tool_descriptors() -> Vec<ToolDescriptor> {
+    vec![
+        tool_descriptor(
+            "get_work_result_state",
+            "App-only exact Work Result refresh: reauthorizes Project and optional Session; never consumes attention or records a Session. Returns Window activity/collaboration, Session evidence and an existing final-changes snapshot sealed by finish_coding_task; never creates/replaces it. files reads advertised immutable paths as diff, UTF-8 content (view=content, 32 KiB/page, 256 KiB/file), or PDF (view=pdf, 128 KiB/page, 20 MiB/file). byte_offset selects a bounded segment of the pinned blob; PDF bytes use private MCP App metadata webcodex/pdfChunk. Missing/stale snapshots require explicit file refresh; retry preserves the exact snapshot/path/offset.",
+        ),
+        tool_descriptor(
+            "read_work_result_activity_detail",
+            "Work Result App-only lazy detail read for one completed call identified by server_trace_id in the current canonical Host Window. The Window identity comes only from Host sideband; every read re-authorizes runtime visibility, returns bounded sanitized timing/correlation metadata, grants no authority, and never records the expansion as Window or Session activity.",
+        ),
+        tool_descriptor(
+            "send_work_result_message",
+            "Work Result App-only Operator-to-Window message. Routes to the current stable ClientWindow, never a Session or peer sender. Project authorization and session:collaborate scope are required; optional session_id is exact, visible, explicitly linked context only. Stores a bounded durable message without consuming model attention or creating a Session. Retry uncertain results with the same delivery_key and payload; conflicting reuse is rejected.",
+        ),
+        tool_descriptor(
+            "read_changed_file_diff",
+            "Work Result App-only bounded lazy read of one advertised path from the card's sealed final snapshot. Re-authorizes exact project + session, validates caller/snapshot/path binding, grants no authority, and never records the click into the target Session.",
+        ),
+    ]
+}
+
+/// Fixed MCP App Host-continuation coordination contract. Definitions remain
+/// globally ModelHidden and deliberately stay outside the generic Stateless
+/// operator-extension universe: only the MCP Apps adapter may project them.
+pub fn agent_continuation_app_tool_descriptors() -> Vec<ToolDescriptor> {
+    vec![
+        tool_descriptor(
+            "get_agent_wait_state",
+            "App-only exact read of one caller-owned durable AgentWait. SQLite is authoritative; this polling call creates no Wake, changes no Wait lifecycle, grants no source authority, and must not count as meaningful Window activity.",
+        ),
+        tool_descriptor(
+            "bind_agent_continuation",
+            "App-only bind of one live View to one exact current Durable Agent Endpoint generation. Supply a stable binding_id generated by the View using 128 secure random bits (wc_host_binding_ plus canonical base64url-no-pad of 16 random bytes). It is the iframe/process-instance fence, never authority. Re-authorizes communication:manage on every call. Normal first bind requires the current process attachment; after Server restart, recovery remains limited to the exact durable binding fingerprint or a canonical Host ClientWindow continuity identity carried outside tool input. Retry a lost response with the same exact binding_id renews without revoking claims or resetting dispatch; a same-Window refreshed iframe may replace its older fence. A different Host Window, stale generation, expired Endpoint, or foreign principal fails closed. No durable continuation truth is created.",
+        ),
+        tool_descriptor(
+            "recover_agent_continuation_endpoint",
+            "App-only idempotent probe+replacement for one exact expired Durable Agent Endpoint. The stale Agent/Endpoint/generation and iframe binding_id are explicit, while same-Window authority comes only from the canonical Host ClientWindow sideband and cannot be self-asserted in tool input. A still-live controller is a no-op. Only natural expiry with matching durable Window continuity may atomically create generation+1; replay returns that same replacement and a different Window or already-successor controller fails closed.",
+        ),
+        tool_descriptor(
+            "get_agent_continuation_state",
+            "App-only exact Host heartbeat and sparse authoritative continuation-state refresh. Renews only the current exact Endpoint/View binding; stale Views fail closed.",
+        ),
+        tool_descriptor(
+            "acquire_agent_continuation_wake",
+            "App-only pre-fence acquire through the existing durable Wake claim state machine. Returns bounded safe identity only; claim fences and consume tokens remain private.",
+        ),
+        tool_descriptor(
+            "prepare_agent_continuation_wake",
+            "App-only crossing of the existing durable dispatch fence immediately before one Host ui/message attempt. Success returns the bounded exact automatic_message in structuredContent.output.app_protocol for this View only, including the one-shot consume token; never copy it to a card, model tool result, or generic context update. Custom ToolResult _meta is not required. Send exactly one ui/message for that Attempt. A timeout or missing/malformed successful envelope may already be post-fence: reconcile state and finish as delivery_unknown, never blindly retry prepare or dispatch.",
+        ),
+        tool_descriptor(
+            "finish_agent_continuation_wake",
+            "App-only record of ui/message dispatch acceptance or conservative post-fence delivery uncertainty. Dispatch acceptance never means model resumed; only exact consume_agent_wake proves the continuation turn ran.",
+        ),
+        tool_descriptor(
+            "unbind_agent_continuation",
+            "App-only best-effort withdrawal of one exact process-local View binding. Stale teardown cannot withdraw a replacement View; durable Wake reconciliation remains owned by the existing Endpoint/Wake state machine.",
+        ),
+    ]
+}
+
+/// Fixed Job-native MCP App Host-continuation coordination contract. Definitions remain
+/// globally ModelHidden; only a UI-capable MCP adapter may project these five tools.
+pub fn job_terminal_continuation_app_tool_descriptors() -> Vec<ToolDescriptor> {
+    vec![
+        tool_descriptor(
+            "bind_job_terminal_continuation",
+            "App-only bind of one live View to one exact caller-owned Job terminal wait. ClientWindow arrives only from Host sideband; binding_id is a process/View fence, never Job authority.",
+        ),
+        tool_descriptor(
+            "get_job_terminal_continuation_state",
+            "App-only bounded state read for one exact current Job terminal binding. Polling is View-internal and never substitutes for model-facing Job observation.",
+        ),
+        tool_descriptor(
+            "prepare_job_terminal_continuation",
+            "App-only crossing of the existing durable pending-to-prepared Job terminal delivery fence. Returns one bounded private automatic_message and exact attempt_id; never blindly retry after a missing or malformed post-fence response.",
+        ),
+        tool_descriptor(
+            "finish_job_terminal_continuation",
+            "App-only record of one prepared Host ui/message dispatch as dispatch_accepted or delivery_unknown. It never proves the fresh model turn already ran and never retries delivery.",
+        ),
+        tool_descriptor(
+            "unbind_job_terminal_continuation",
+            "App-only best-effort withdrawal of one exact process-local Job View binding. Pre-prepare teardown leaves pending recoverable; post-prepare teardown reconciles conservatively to delivery_unknown.",
+        ),
+    ]
+}
+
+pub fn goal_plan_app_tool_specs() -> Vec<ToolSpec> {
+    goal_plan_app_tool_descriptors()
+        .into_iter()
+        .map(ToolDescriptor::into_spec)
+        .collect()
+}
+
+pub fn artifact_app_tool_specs() -> Vec<ToolSpec> {
+    artifact_app_tool_descriptors()
+        .into_iter()
+        .map(ToolDescriptor::into_spec)
+        .collect()
+}
+
+pub fn work_result_app_tool_specs() -> Vec<ToolSpec> {
+    work_result_app_tool_descriptors()
+        .into_iter()
+        .map(ToolDescriptor::into_spec)
+        .collect()
+}
+
+pub fn agent_continuation_app_tool_specs() -> Vec<ToolSpec> {
+    agent_continuation_app_tool_descriptors()
+        .into_iter()
+        .map(ToolDescriptor::into_spec)
+        .collect()
+}
+
+pub fn job_terminal_continuation_app_tool_specs() -> Vec<ToolSpec> {
+    job_terminal_continuation_app_tool_descriptors()
+        .into_iter()
+        .map(ToolDescriptor::into_spec)
+        .collect()
+}
+
+fn operator_family_descriptors(family: ToolOperatorExtensionFamily) -> Vec<ToolDescriptor> {
+    let descriptors = match family {
+        ToolOperatorExtensionFamily::SkillRuntime | ToolOperatorExtensionFamily::SkillManagement => skills::tool_descriptors(),
+        ToolOperatorExtensionFamily::MemoryRuntime | ToolOperatorExtensionFamily::MemoryManagement => memory::tool_descriptors(),
+        ToolOperatorExtensionFamily::TraceDiagnostics => vec![tool_descriptor("read_tool_trace", "Admin-only diagnostics over retained ActionAudit and Server trace files. Omit trace_ref to find calls/windows using query time range, exact Project or tool; reuse returned query bounds when paging. With trace_ref, offset/limit page metadata events (including bounded supplied/kernel arguments and context-return receipts); payload events advertise payload_index for explicit full-payload reads. Query and trace_ref cannot be combined. Missing capture is unknown, not proof the call did not occur. Stored captures remain readable after capture is disabled. No new authority, execution, or retry permission.")],
+    };
+    descriptors
+        .into_iter()
+        .filter(|descriptor| {
+            runtime_tool_operator_extension_family(&descriptor.name) == Some(family)
+        })
+        .collect()
+}
+
+pub fn operator_diagnostic_tool_specs() -> Vec<ToolSpec> {
+    operator_family_descriptors(ToolOperatorExtensionFamily::TraceDiagnostics)
+        .into_iter()
+        .map(ToolDescriptor::into_spec)
+        .collect()
+}
+
+pub fn memory_runtime_tool_specs() -> Vec<ToolSpec> {
+    operator_family_descriptors(ToolOperatorExtensionFamily::MemoryRuntime)
+        .into_iter()
+        .map(ToolDescriptor::into_spec)
+        .collect()
+}
+
+pub fn memory_management_tool_specs() -> Vec<ToolSpec> {
+    operator_family_descriptors(ToolOperatorExtensionFamily::MemoryManagement)
+        .into_iter()
+        .map(ToolDescriptor::into_spec)
+        .collect()
+}
+
+pub fn skill_runtime_tool_specs() -> Vec<ToolSpec> {
+    operator_family_descriptors(ToolOperatorExtensionFamily::SkillRuntime)
+        .into_iter()
+        .map(ToolDescriptor::into_spec)
+        .collect()
+}
+
+pub fn skill_management_tool_specs() -> Vec<ToolSpec> {
+    operator_family_descriptors(ToolOperatorExtensionFamily::SkillManagement)
+        .into_iter()
+        .map(ToolDescriptor::into_spec)
+        .collect()
+}
+
+/// Canonical ordered operator-extension universe. Capability/authority filtering
+/// belongs to the adapter; the catalog itself never grants access.
+pub fn stateless_operator_extension_tool_descriptors() -> Vec<ToolDescriptor> {
+    [
+        ToolOperatorExtensionFamily::SkillRuntime,
+        ToolOperatorExtensionFamily::SkillManagement,
+        ToolOperatorExtensionFamily::MemoryRuntime,
+        ToolOperatorExtensionFamily::MemoryManagement,
+        ToolOperatorExtensionFamily::TraceDiagnostics,
+    ]
+    .into_iter()
+    .flat_map(operator_family_descriptors)
+    .collect()
+}
+
+pub fn stateless_operator_extension_tool_specs() -> Vec<ToolSpec> {
+    stateless_operator_extension_tool_descriptors()
+        .into_iter()
+        .map(ToolDescriptor::into_spec)
+        .collect()
+}
+
+fn resolve_tool_descriptors<'a>(
+    definitions: impl IntoIterator<Item = &'a ToolDefinition>,
+) -> Vec<ToolDescriptor> {
+    let mut specs = Vec::new();
+    let mut seen_definition_names = BTreeSet::new();
+    for definition in definitions {
+        if !seen_definition_names.insert(definition.name) {
+            panic!(
+                "{} model-visible ToolDefinition is duplicated",
+                definition.name
+            );
+        }
+        let model_spec = definition.model_spec.unwrap_or_else(|| {
+            panic!(
+                "{} model-visible ToolDefinition is missing model spec",
+                definition.name
+            )
+        });
+        specs.push(tool_descriptor(definition.name, model_spec.description));
+    }
+    specs
+}
+
+fn tool_descriptor(name: &'static str, description: impl Into<String>) -> ToolDescriptor {
+    debug_assert!(
+        lookup_tool_definition(name).is_some(),
+        "{name} descriptor lacks definition"
+    );
+    ToolDescriptor {
+        name: name.to_owned(),
+        description: description.into(),
+        discovery_keywords: lookup_tool_definition(name)
+            .and_then(|definition| definition.model_spec)
+            .map_or(&[], |spec| spec.discovery_keywords),
+    }
+}
+
+#[cfg(test)]
+fn tool_spec(name: &'static str, description: impl Into<String>) -> ToolSpec {
+    tool_descriptor(name, description).into_spec()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn descriptors_preserve_full_contract_metadata_and_order_without_materialization() {
+        take_tool_materialization_counts_for_test();
+        let descriptors = registered_tool_descriptors()
+            .into_iter()
+            .chain(exact_manifest_specialist_tool_descriptors())
+            .chain(stateless_operator_extension_tool_descriptors())
+            .chain(goal_plan_app_tool_descriptors())
+            .chain(artifact_app_tool_descriptors())
+            .chain(work_result_app_tool_descriptors())
+            .chain(agent_continuation_app_tool_descriptors())
+            .chain(job_terminal_continuation_app_tool_descriptors())
+            .collect::<Vec<_>>();
+        assert_eq!(take_tool_materialization_counts_for_test(), (0, 0));
+        let specs = registered_tool_specs()
+            .into_iter()
+            .chain(exact_manifest_specialist_tool_specs())
+            .chain(stateless_operator_extension_tool_specs())
+            .chain(goal_plan_app_tool_specs())
+            .chain(artifact_app_tool_specs())
+            .chain(work_result_app_tool_specs())
+            .chain(agent_continuation_app_tool_specs())
+            .chain(job_terminal_continuation_app_tool_specs())
+            .collect::<Vec<_>>();
+        assert_eq!(descriptors.len(), specs.len());
+        for (descriptor, spec) in descriptors.iter().zip(&specs) {
+            assert_eq!(descriptor.name, spec.name);
+            assert_eq!(descriptor.description, spec.description);
+            assert_eq!(descriptor.discovery_keywords, spec.discovery_keywords);
+            assert_eq!(
+                descriptor.discovery_keywords,
+                lookup_tool_definition(&spec.name)
+                    .unwrap()
+                    .model_spec
+                    .map_or(&[][..], |model| model.discovery_keywords)
+            );
+            let public = serde_json::to_value(spec).unwrap();
+            assert!(public.get("discoveryKeywords").is_none());
+            assert!(public.get("discovery_keywords").is_none());
+            let mut seen_keywords = BTreeSet::new();
+            assert!(spec.discovery_keywords.len() <= 32);
+            for keyword in spec.discovery_keywords {
+                assert!(!keyword.is_empty() && keyword.chars().count() <= 64);
+                assert_eq!(*keyword, keyword.to_lowercase());
+                assert!(keyword.is_ascii() || keyword.chars().count() >= 2);
+                assert!(
+                    seen_keywords.insert(keyword),
+                    "duplicate keyword on {}",
+                    spec.name
+                );
+            }
+            assert_eq!(descriptor.annotations(), spec.annotations);
+            assert_eq!(spec.input_schema, input_schema_for_tool(&spec.name));
+            assert_eq!(spec.output_schema, output_schema_for_tool(&spec.name));
+        }
+    }
+
+    fn collect_schema_descriptions<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
+        match value {
+            Value::Object(map) => {
+                if let Some(description) = map.get("description").and_then(Value::as_str) {
+                    out.push(description);
+                }
+                for nested in map.values() {
+                    collect_schema_descriptions(nested, out);
+                }
+            }
+            Value::Array(values) => {
+                for nested in values {
+                    collect_schema_descriptions(nested, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn model_visible_definitions_own_all_registered_model_specs() {
+        let definitions = model_visible_tool_definitions().collect::<Vec<_>>();
+        let definition_names = definitions
+            .iter()
+            .map(|definition| definition.name)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            definition_names.len(),
+            definitions.len(),
+            "model-visible ToolDefinition names must be unique"
+        );
+        for definition in &definitions {
+            assert!(
+                definition.model_spec.is_some(),
+                "{} model-visible ToolDefinition must own description + input schema",
+                definition.name
+            );
+        }
+
+        let specs = registered_tool_specs();
+        let spec_names = specs
+            .iter()
+            .map(|spec| spec.name.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            spec_names.len(),
+            specs.len(),
+            "registered ToolSpecs must be unique"
+        );
+        assert_eq!(spec_names, definition_names);
+        assert_eq!(specs.len(), definitions.len());
+    }
+
+    #[test]
+    fn stateless_operator_extension_specs_are_one_unique_hidden_family_union() {
+        let expected = skill_runtime_tool_specs()
+            .into_iter()
+            .chain(skill_management_tool_specs())
+            .chain(memory_runtime_tool_specs())
+            .chain(memory_management_tool_specs())
+            .chain(operator_diagnostic_tool_specs())
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        let actual = stateless_operator_extension_tool_specs()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual, expected,
+            "canonical extension ordering/families drifted"
+        );
+
+        let unique = actual.iter().map(String::as_str).collect::<BTreeSet<_>>();
+        assert_eq!(
+            unique.len(),
+            actual.len(),
+            "extension ToolSpecs must be unique"
+        );
+        let generic = registered_tool_specs()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<BTreeSet<_>>();
+        assert!(
+            unique.iter().all(|name| !generic.contains(*name)),
+            "Stateless operator extensions must remain outside registered_tool_specs: {unique:?}"
+        );
+    }
+
+    #[test]
+    fn register_project_definition_owned_model_spec_matches_exact_contract() {
+        let actual = registered_tool_specs()
+            .into_iter()
+            .find(|spec| spec.name == "register_project")
+            .expect("register_project spec");
+        let expected = tool_spec(
+            "register_project",
+            "Register an existing directory, including a non-Git or ad-hoc workspace, as a Project on one Runner. Successful onboarding returns the canonical Runtime Project id and a Server-issued project_ref when a stable root identity is available. Use this when the directory already exists; policy still bounds allowed paths.",
+        );
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(expected).unwrap(),
+            "definition-owned register_project ToolSpec must preserve name, description, input/output schemas, and annotations exactly"
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "register_project model-visible ToolDefinition is missing model spec"
+    )]
+    fn model_spec_omission_fails_closed() {
+        let mut definition =
+            *lookup_tool_definition("register_project").expect("register_project ToolDefinition");
+        assert!(definition.model_spec.is_some());
+        definition.model_spec = None;
+        let _ = resolve_tool_descriptors(std::iter::once(&definition));
+    }
+
+    #[test]
+    #[should_panic(expected = "register_project model-visible ToolDefinition is duplicated")]
+    fn duplicate_definition_owned_model_specs_fail_closed() {
+        let definition =
+            *lookup_tool_definition("register_project").expect("register_project ToolDefinition");
+        assert!(definition.model_spec.is_some());
+        let duplicate = definition;
+        let _ = resolve_tool_descriptors([&definition, &duplicate]);
+    }
+
+    #[test]
+    fn reliability_tool_descriptions_are_selection_dense_and_keep_lifecycle_contracts() {
+        let specs = registered_tool_specs();
+        let find = |name: &str| {
+            specs
+                .iter()
+                .find(|spec| spec.name == name)
+                .unwrap_or_else(|| panic!("missing tool spec: {name}"))
+        };
+
+        for spec in &specs {
+            assert!(
+                spec.description.chars().count() <= crate::MODEL_TOOL_DESCRIPTION_MAX_CHARS,
+                "{} description exceeds the hard model budget ({} > {} chars): {}",
+                spec.name,
+                spec.description.chars().count(),
+                crate::MODEL_TOOL_DESCRIPTION_MAX_CHARS,
+                spec.description
+            );
+        }
+
+        for name in [
+            "run_process",
+            "run_script",
+            "cargo_fmt",
+            "cargo_check",
+            "cargo_test",
+            "go_test",
+        ] {
+            let description = &find(name).description;
+            assert!(
+                description.contains("same execution"),
+                "{name}: {description}"
+            );
+            assert!(!description.contains("run_job"), "{name}: {description}");
+        }
+        assert!(find("run_process").description.contains("run_shell"));
+        assert!(find("run_script").description.contains("run_shell"));
+        for name in ["cargo_fmt", "cargo_check", "cargo_test", "go_test"] {
+            let description = &find(name).description;
+            assert!(!description.contains("run_shell"), "{name}: {description}");
+        }
+
+        let run_job = &find("run_job").description;
+        assert!(run_job.contains("stable job_id"), "{run_job}");
+        assert!(run_job.contains("observe"), "{run_job}");
+        assert!(run_job.contains("retry"), "{run_job}");
+
+        let observe_jobs = find("observe_jobs");
+        let description = &observe_jobs.description;
+        let lower = description.to_ascii_lowercase();
+        assert!(lower.contains("never"), "observe_jobs: {description}");
+        assert!(lower.contains("retr"), "observe_jobs: {description}");
+
+        let token = observe_jobs.input_schema["properties"]["items"]["items"]["oneOf"][0]
+            ["properties"]["after_observation_token"]["description"]
+            .as_str()
+            .expect("observe_jobs raw-selector observation token description");
+        assert!(token.contains("not execution identity"), "{token}");
+        assert!(token.contains("Server epoch"), "{token}");
+        assert!(token.contains("without interpreting"), "{token}");
+        assert!(token.contains("Return it unchanged"), "{token}");
+        let wait = observe_jobs.input_schema["properties"]["wait_secs"]["description"]
+            .as_str()
+            .expect("observe_jobs wait description");
+        assert!(wait.contains("one shared bounded wait"), "{wait}");
+        assert!(
+            wait.contains(
+                &webcodex_core::runtime_contract::MAX_JOB_OBSERVATION_WAIT_SECS.to_string()
+            ),
+            "{wait}"
+        );
+
+        let register = find("register_project");
+        assert!(
+            register.description.contains("non-Git"),
+            "{}",
+            register.description
+        );
+        assert_eq!(
+            register.input_schema["properties"]["path"]["description"].as_str(),
+            Some("Existing absolute directory path on the Runner. Git is not required.")
+        );
+        let work_on_project = &find("work_on_project").description;
+        assert!(work_on_project.contains("project or client_id+path"));
+        assert!(work_on_project.contains("does not require Git"));
+        assert!(work_on_project.contains("mode=worktree"));
+        assert!(work_on_project.contains("exact Git base"));
+        assert!(work_on_project.contains("Project authority"));
+        assert!(work_on_project.contains("session_id alone"));
+        assert!(work_on_project.contains("An explicit Project must match"));
+        let status = &find("get_runtime_status").description;
+        for hint in [
+            "Job concurrency",
+            "sparse",
+            "full diagnostics",
+            "compact=false",
+        ] {
+            assert!(status.contains(hint), "get_runtime_status: {status}");
+        }
+        for name in ["list_runners"] {
+            let description = &find(name).description;
+            assert!(
+                description.contains("shared Job concurrency"),
+                "{name}: {description}"
+            );
+            assert!(
+                description.contains("host_context"),
+                "{name}: {description}"
+            );
+            assert!(description.contains("advisory"), "{name}: {description}");
+            assert!(description.contains("authority"), "{name}: {description}");
+        }
+
+        for spec in &specs {
+            if !matches!(
+                spec.name.as_str(),
+                "run_shell" | "run_process" | "run_script" | "execute_session_shell"
+            ) {
+                assert!(
+                    !spec.description.contains("run_shell"),
+                    "{} pollutes exact run_shell discovery: {}",
+                    spec.name,
+                    spec.description
+                );
+            }
+            if spec.name != "run_job" {
+                assert!(
+                    !spec.description.contains("run_job"),
+                    "{} pollutes exact run_job discovery: {}",
+                    spec.name,
+                    spec.description
+                );
+            }
+            if spec.name != "work_on_project" {
+                assert!(
+                    !spec.description.contains("work_on_project"),
+                    "{} pollutes exact work_on_project discovery: {}",
+                    spec.name,
+                    spec.description
+                );
+            }
+        }
+
+        for spec in &specs {
+            let mut descriptions = Vec::new();
+            collect_schema_descriptions(&spec.input_schema, &mut descriptions);
+            collect_schema_descriptions(&spec.output_schema, &mut descriptions);
+            for description in descriptions {
+                if spec.name != "run_shell" {
+                    assert!(
+                        !description.contains("run_shell"),
+                        "{} schema pollutes exact run_shell discovery: {description}",
+                        spec.name
+                    );
+                }
+                if spec.name != "run_job" {
+                    assert!(
+                        !description.contains("run_job"),
+                        "{} schema pollutes exact run_job discovery: {description}",
+                        spec.name
+                    );
+                }
+                if spec.name != "work_on_project" {
+                    assert!(
+                        !description.contains("work_on_project"),
+                        "{} schema pollutes exact work_on_project discovery: {description}",
+                        spec.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tool_specs_unified_diff_field_rejects_codex_wrapper() {
+        let specs = exact_manifest_specialist_tool_specs();
+        let spec = specs
+            .iter()
+            .find(|spec| spec.name == "apply_unified_diff")
+            .expect("missing apply_unified_diff spec");
+        let description = spec.input_schema["properties"]["diff"]["description"]
+            .as_str()
+            .expect("missing unified diff description");
+        let lower = description.to_lowercase();
+        assert!(lower.contains("raw standard unified diff"), "{description}");
+        assert!(
+            description.contains("Codex apply_patch wrapper"),
+            "{description}"
+        );
+        assert!(description.contains("*** Begin Patch"), "{description}");
+    }
+}

@@ -1,0 +1,47 @@
+# Repository Maintenance
+
+This page defines durable repository-maintenance policy for maintainers and contributors. It is not a roadmap, changelog, release ledger, or branch-local TODO list.
+
+## Sources of truth
+
+- [`AGENTS.md`](../AGENTS.md) contains the executable repository-work rules for coding agents and maintainers.
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) and [`agent/architecture-decisions.md`](agent/architecture-decisions.md) contain durable product structure and design rationale.
+- [`TESTING.md`](TESTING.md) defines test lanes and validation principles.
+- [`SECURITY.md`](../SECURITY.md) defines security boundaries and how to report sensitive vulnerabilities without exposing private details.
+- [`RELEASE_CHECKLIST.md`](RELEASE_CHECKLIST.md) and [`agent/release-process.md`](agent/release-process.md) define release readiness and publication.
+- [GitHub Issues](https://github.com/yyjeqhc/webcodex/issues) is the canonical queue for non-sensitive, safe-to-disclose actionable cross-branch maintenance work, technical debt, and follow-ups. Use the existing `priority:*` and `area:*` labels when they improve triage, but keep the issue body as the work contract.
+
+If a non-sensitive actionable item will not be completed in the current change, open or update a GitHub Issue instead of adding a competing debt/backlog Markdown file on a feature branch. Sensitive security findings must follow [`SECURITY.md`](../SECURITY.md) and must not be copied into a public Issue until the details are safe to disclose. Repository docs may explain durable rationale and future direction, but should not mirror Issue state.
+
+## Branches, pull requests, and validation
+
+- Fetch the intended target repository's `main` before starting non-trivial work and prefer a focused branch or suitable worktree for one coherent change. In a fork checkout, distinguish the fork remote from the upstream PR target; fetching the target does not require changing or publishing the fork's `main`.
+- Link the pull request to the relevant Issue. Use a closing keyword only when the merged pull request fully satisfies that Issue's acceptance criteria.
+- Follow [`AGENTS.md`](../AGENTS.md) for focused validation. Documentation-only changes normally require `python3 scripts/check_markdown_links.py`, not Cargo compilation or broad test suites.
+- Follow [`TESTING.md`](TESTING.md) for the current pull-request and `main` CI mapping. Keep workflow trigger details there instead of duplicating them in maintenance policy.
+- For many open PRs, use `python3 scripts/open_pr_health.py --only-perf` (or `python` on Windows) to collect CI/check and merge-state evidence through a **single** bounded `gh pr list` request rather than one `gh pr view` per PR. This is read-only and does not merge, approve, or rerun checks. A fetch at its limit may omit other PRs; explicit per-PR diagnostics still require targeted views.
+
+## Dependency maintenance
+
+Review direct Rust and npm dependency freshness and relevant security advisories at least monthly or before release preparation, whichever comes first. Security-relevant updates with meaningful impact should be handled promptly rather than waiting for that cadence.
+
+Record safe-to-disclose actionable dependency work as GitHub Issues and keep dependency-only changes narrow where practical. Sensitive security findings follow [`SECURITY.md`](../SECURITY.md) and stay out of public Issues until disclosure is appropriate. Do not mix unrelated upgrades into feature work, and do not treat dependency review as release authorization; release publication remains governed by the release checklist.
+
+## Bilingual documentation
+
+For user-facing documentation that already has a tracked `*.zh-CN.md` peer, the English file is the canonical source for normative wording.
+
+- Changes to commands, configuration, installation, deployment, security, or user-visible runtime contracts should update the English and Chinese peers in the same pull request.
+- Purely editorial prose may defer translation only when the pull request records the deferral and links a durable GitHub Issue before merge; do not leave silent contract drift.
+- Internal or agent-facing documents without an existing translated peer do not need a new translation solely for symmetry.
+
+## Documentation scope and verification
+
+- README and the documentation index explain the product and route users to current setup and reference guides. Repository contribution rules live in `AGENTS.md` and `CONTRIBUTING.md`; runtime caller guidance lives in `CODING_WORKFLOW.md` and its linked domain contracts.
+- Keep current commands, tool names, defaults, and authority claims aligned with their owning schemas, manifests, implementation, and focused tests. If code and approved policy disagree, identify the conflict rather than silently weakening the policy to match code.
+- Distinguish published-release behavior, current development contracts, future designs, and historical acceptance reports. Link to the owning current contract instead of copying a second normative version. Preserve source revisions and validation limits in historical reports.
+- Run `python3 scripts/check_markdown_links.py` and `git diff --check` for documentation changes. The link checker checks tracked repository-local file destinations; it does not verify heading anchors, external URLs, commands, or factual accuracy. Review those separately for the changed text.
+
+## Lightweight maintenance sweep
+
+Once a month or during release preparation, do a short maintenance pass over open safe-to-disclose maintenance/security Issues, direct dependency/security status, sensitive findings handled under [`SECURITY.md`](../SECURITY.md), and evergreen docs for obsolete phase-specific acceptance text. Record only safe-to-disclose actionable findings as Issues; do not create a second roadmap or maintenance ledger.

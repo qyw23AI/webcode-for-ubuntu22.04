@@ -1,0 +1,633 @@
+# Runner
+
+Runner 是真正执行工作的组件。可执行文件是 `webcodex-runner`；管理它的 CLI 命名
+空间是 `webcodex runner ...`。`webcodex` 与 `webcodex-runner` 是两个独立可执行
+文件。运维生命周期统一使用 `runner` 命名空间；历史 `agent` 术语只保留在兼容性所需
+的令牌、存储、身份、项目 id 与 wire contract 中。本页说明 Runner 做什么、如何连接、
+如何注册项目、如何以服务方式运维，以及它的主要运行时概念。
+
+安装与服务设置见[部署指南](DEPLOYMENT.zh-CN.md)；管理 Runner 的命令见
+[CLI](CLI.zh-CN.md#runner-生命周期)。
+
+## Runner 做什么
+
+Runner 运行在持有仓库的机器上。它主动连接 WebCodex Server，注册它允许服务的
+项目，并在这些项目边界内执行有界操作——文件读写、Git 检查、结构化校验、shell
+命令与长任务 Job。
+
+Runner 是最接近你仓库的信任边界。请用窄的 allowed roots 与显式 shell profile
+配置它，而不是继承宽泛的交互式 shell 状态。
+
+## 核心术语
+
+| 术语 | 含义 |
+| --- | --- |
+| **Server** | 认证调用方、保存共享 runtime 状态并路由工作。 |
+| **CLI** | 运维/开发者使用的 `webcodex` 命令。 |
+| **Runner** | 在仓库机器上执行工作的 `webcodex-runner` 进程。 |
+| **profile** | 一组命名的本地 Runner/client 配置。 |
+| **client_id** | 一个 Runner/设备的稳定逻辑名称。 |
+| **Project** | 由该 Runner 注册的一个仓库/工作区。 |
+
+部分 compatibility-facing value 仍使用历史 `agent` 名称，例如 Runner token 的 `wc_agent_*` 前缀与 `agent:<client_id>:<project_id>` runtime Project address。它们不属于 WebCodex 独立的 Durable Agent domain；普通用户也不需要理解 Runner recovery 背后的进程级 lease identifier。
+
+### Runner 配置命名
+
+WebCodex 0.5 只使用 canonical Runner 启动命名：自动/default/profile discovery 只定位 `runner.toml`，默认配置路径环境变量只认 `WEBCODEX_RUNNER_CONFIG`，registry 字段只认 `project_registry_dir`，默认 registry directory 只使用 `project-registry/`。0.4.x 的兼容输入 `agent.toml`、`WEBCODEX_AGENT_CONFIG`、`projects_dir` 以及自动发现 `projects.d/` 不再参与启动。旧 `projects_dir` 字段会被明确拒绝，而不是静默忽略，避免旧配置看似启动成功却切换到另一套 registry。显式 `--config PATH` 仍严格使用调用方指定路径，不根据文件名进行重新解释。
+## 连接 Server
+
+Runner 主动向外连接 Server，使用四种传输之一，由 `runner.toml` 中的 `transport`
+设置选择：
+
+| 传输 | 配置值 | 用途 |
+| --- | --- | --- |
+| Auto | `auto` | 生产环境推荐（配置 `[quic]` 时）：先 QUIC，再 WebSocket，最后 polling。 |
+| QUIC | `quic` | 仅 QUIC。Server 端独立 UDP listener。 |
+| WebSocket | `websocket` | 无 UDP 场景的稳定 fallback。 |
+| Polling | `polling` | 受限网络的最后手段。 |
+
+Runner 使用 Runner token（兼容前缀 `wc_agent_*`）认证；hosted shared-key 模式则使用对应 shared key。这个 credential 只用于 Runner transport，不用于 MCP 或 REST。
+
+WebSocket 与 polling 都使用 `Authorization: Bearer <token>` 认证 first-party
+Runner；Runner query-string credential 不再接受。QUIC 把凭据限制在
+transport-specific v1 首个注册帧中，共享 Runner envelope 不再携带凭据。
+
+### Server/Runner 兼容
+
+旧安装跨越 0.4 边界升级时，应同步升级 first-party Server 与 Runner。`0.4.x` 内保持稳定 protocol baseline，新 optional capability 通过显式 capability 增量加入；旧但兼容的 Runner 缺少某项 capability 时，该功能 fail closed，而不是猜测或模拟支持。
+
+精确的 protocol-generation field、baseline capability list、registration grammar 与 compatibility test matrix 属于 maintainer/wire contract，有意不放在这份运维指南中。
+
+ChatGPT Host 提示“当前会话不支持 developer MCP”并不是 Runner heartbeat 或 reconnect
+结果。如果 ChatGPT 连 `get_runtime_status` 都无法 dispatch，应先在本机执行
+`webcodex runner status` 并查看有界 Runner 日志，再决定是否重启或修改 Runner 配置。
+Host / Server / Runner 的分层判断见[故障排查](TROUBLESHOOTING.zh-CN.md)。
+
+使用 QUIC 时保持 Server/Runner QUIC 配置一致。`[quic].keepalive_interval_secs` 默认 20 秒，允许 `1..=25`；非法值会被拒绝，不会 silent clamp。
+
+## 注册项目
+
+项目存放在 Runner 机器上。Runner 把允许的目录注册给 Server；Server 不扫描文件
+系统，也不自行发现项目路径。
+
+每个注册项目是 Runner `project_registry_dir`（默认 `project-registry`）下的一个一文件一项目
+TOML：
+
+```toml
+id = "webcodex"
+path = "/srv/webcodex/projects/webcodex"
+name = "WebCodex"
+kind = "repo"
+allow_patch = true
+```
+
+真正重要的是 `id` 与 `path`；`kind` 只属于可选描述 metadata。Registry directory
+用于保存 Project record，本身不是 workspace root。
+
+新配置与默认 discovery 只使用 `project-registry/` 和 `project_registry_dir`。WebCodex 0.5 不再自动选择历史 `projects.d/` 目录，旧 `projects_dir` 配置字段会直接报错并给出迁移提示。升级前应把仍需要的 Project registration record 移到或重新生成到 canonical registry。旧 `--projects-dir` CLI flag 继续保持 retired；显式 CLI 选择使用 `--project-registry-dir`。
+Runtime Project 的 canonical id 仍形如 `agent:<client_id>:<project_id>`，例如 `agent:workstation:my-repo`。该 canonical identity 继续用于 authorization、persistence、audit、Runner routing、diagnostic、API 与 CLI 显式 addressing。Model-facing bootstrap/discovery 还可以返回很短的 Server-issued `project_ref`（例如 `~p1`）；后续 Project-scoped tool call 应优先复用它，而不是反复复制 canonical id。映射由 Server 持久维护并按 authenticated caller 隔离，同时钉住 canonical id 与 Runner 报告的 Project root identity；它不是 credential/capability，每次使用都会重新执行当前 Project visibility/authorization。该 ref 不依赖 Workflow Session、ClientWindow、MCP session、transport connection、recent activity 或 Host hidden state；失效 ref 绝不会静默重绑到另一个 Project。
+
+### 允许根目录
+
+Runner policy 中的 `allowed_roots` 控制项目可以在哪里注册或创建：
+
+- `allowed_roots` 缺失或为空时默认 `$HOME`。
+- 显式 `allowed_roots` 覆盖该默认值。
+- 用显式 roots 把 Runner 收窄到某个工作区，例如：
+
+```toml
+[policy]
+allow_cwd_anywhere = false
+allowed_roots = ["/root/git"]
+```
+
+### 运行时注册项目
+
+runtime 工具 `register_project` 与 `create_project` 让客户端在在线 Runner 上
+注册已有目录或创建新目录，受 Runner 的 `allowed_roots` policy 约束。
+
+## Skill 来源
+
+`list_skills` 继续只暴露一个 catalog，但其中保留三种彼此独立的 ownership / lifecycle：
+
+**自 v0.4.2 起可用：** configured live Runner Skill roots 与 Managed Runner Skill Store 会共同参与这个统一 catalog。v0.4.1 的 `list_skills` 不会隐式扫描 `~/.codex/skills`；如果希望该目录参与 v0.4.2+ discovery，必须在 `[skills].roots` 中显式配置。
+
+| 来源 | 位置 / owner | Trust | 版本语义 |
+| --- | --- | --- | --- |
+| Project Skills | `<project>/.agents/skills/<package>/SKILL.md` | `project_content` | Project live content；没有 package revision。 |
+| Configured live Runner Skill roots | Runner 主机上由 operator 配置的绝对目录 | `operator_configured_guidance` | WebCodex 不修改的 live filesystem content；受支持脚本可通过 `run_skill_resource` 执行；没有 install、activation、rollback 或 package revision。 |
+| Managed Runner Skill Store | Runner state 下的 `runner-skills-v1` | `operator_installed_guidance` | immutable package revision，并保留 install、activation、remove 与 rollback-oriented Store 语义。 |
+
+`skill_list.sources` 固定报告这三类逻辑 source，并提供有界的 `status`、计数、truncation 与安全 reason code。source 为 available 且 `skill_count=0` 表示 discovery 成功但没有发现 Skill，不代表索引损坏。只有 Project source 会暴露逻辑 root hint `.agents/skills`；Runner 上真实 configured root 路径保持私有。
+
+Configured live roots 默认不存在，需要在 Runner 的 `runner.toml` 中显式配置：
+
+```toml
+[skills]
+roots = [
+    "/home/alice/.codex/skills",
+    "/home/alice/.agents/skills",
+    "/opt/company/agent-skills",
+]
+```
+
+Windows 使用等价的本机绝对路径；包含反斜杠时可以使用 TOML literal string：
+
+```toml
+[skills]
+roots = [
+    'C:\Users\alice\.codex\skills',
+    'C:\Users\alice\.agents\skills',
+]
+```
+
+每个 root 直接包含 `<root>/<package>/SKILL.md`，package 内可以有 `references/`
+与 `scripts/` 等 resource。WebCodex 不会修改 configured root 内的文件，也不会把
+它们复制到 managed Store；`install_skill`、`activate_skill` 与
+`remove_skill_revision` 仍然只修改 managed Store。这里的“不修改”不等于“不可执行”：
+operator 配置的 trusted Skill 中，受支持的 `scripts/*.py` / `scripts/*.sh` 可以通过
+`run_skill_resource` 执行。
+
+这些路径始终属于 **Runner 主机**；Server 与 Runner 不在同一台机器时也不会改用
+Server 的 filesystem。把 root 放进配置本身就是 operator 对该 Skill source 的显式 trust
+选择，但该 trust 只用于 narrow Skill runtime。Configured roots 不会加入
+`[policy].allowed_roots`，因此不会给普通 Project file/shell/process 工具扩大文件系统
+authority，native root path 也不会投影到 model-facing Skill catalog。Skill read 与
+`run_skill_resource` 只提交 opaque `skill_id` 与 package-relative resource path，由 Runner
+根据 trusted config 解析 root，并拒绝 traversal 与 link escape。
+
+Skill 文件本身是 live 的：修改 `SKILL.md` 或 resource 后，下一次 discovery/read 会直接
+看到新内容，不需要 reload。对 configured Skill，`expected_definition_revision` 只 fence
+`SKILL.md` definition，并不会把 resource bytes 固定为 immutable 内容；
+`run_skill_resource` 会在执行时重新读取脚本，并通过 `skill_sha256` 返回实际执行 bytes 的
+SHA-256。Managed installed Skill 还会用 `expected_package_revision` fence immutable package。
+只有修改 `roots` 配置列表时才需要按正式流程先执行 `check_runner_config`，再携带当前
+generation 执行 `reload_runner_config`；该字段支持 hot reload，不需要重启 Runner 进程。
+
+## Runner build identity
+
+Runner 连接后，`get_runtime_status(client_id=...)` 与 `list_runners` 会暴露有界、非敏感的 binary identity：package version、Git commit/dirty 状态、build timestamp、Cargo target triple 与 architecture。旧 Runner 可以缺省这些 optional 字段。该信息用于部署与 source-alignment 诊断，不包含 executable path、environment、token 或 credential；连接前仍可用 `webcodex-runner --version` 做本机 identity 检查。
+
+## Runner 级 configured instructions
+
+同一台 Runner 可以为其所有 Project bootstrap 投影一份共享 coding guidance。v1 直接在
+Runner 的 `runner.toml` 中手工配置；Desktop 的文件选择/上传 UI 留待后续实现。
+
+```toml
+[instructions]
+files = [
+    "/home/alice/.codex/AGENTS.md",
+]
+```
+
+macOS 使用等价的 Runner 本机绝对路径，例如 `/Users/alice/.codex/AGENTS.md`。Windows
+可使用 TOML literal string，避免反斜杠转义：
+
+```toml
+[instructions]
+files = [
+    'C:\Users\alice\.codex\AGENTS.md',
+]
+```
+
+不会隐式发现 `~/.codex/AGENTS.md`；所有路径都必须由用户显式配置，并且是 Runner 本机
+绝对路径。Coding startup 按确定顺序先投影 Runner configured sources，再投影现有
+Project-local candidates：`AGENTS.md`、`agents.md`、`CLAUDE.md`、
+`.codex/AGENTS.md`、`.github/copilot-instructions.md`。两者都只是 model guidance，
+不会改变执行 authority。
+
+Configured instruction 文件只通过 narrow Runner-owned instruction runtime 读取。其父目录
+不会加入 `[policy].allowed_roots`，普通 Project file/shell/process 工具不会因此得到额外
+filesystem authority，Runner native absolute path 也不会投影给模型；model-facing source
+只使用 sanitized logical identity。
+
+配置来源必须是普通 UTF-8 文件，每个文件最多 1 MiB。文件及其父目录组件不能是
+symbolic link 或 Windows reparse point（包括目录 junction）；此时应配置解析后的
+物理路径。Unix 上父目录通过 handle-relative traversal 逐层固定，并在平台提供
+search-only 目录打开语义时保持原有的仅执行/搜索权限行为；Windows 会先用 native
+no-reparse open 获取父目录，再相对这个已固定的父目录句柄打开 leaf，并在接受
+observation 前重新核对父目录 identity，因此并发父目录替换不能把 configured read
+重定向到别处。非 Unix/Windows 目标直接 fail closed，不再回退到按路径重新打开。Windows verbatim disk/UNC 长路径仍可接受，但远端
+文件系统最终取决于服务端实际提供的 reparse 与 handle 语义，不能假定比远端实现
+本身更强的保证。读取时检查已打开的文件句柄，并在读取过程中强制限制字节数，
+而不只依赖读取前的 metadata。无法读取、被重定向、
+超限或 UTF-8 无效的来源会将 instruction scan 标记为 incomplete，但不会暴露原生路径
+或令整个 Project bootstrap 失败。
+
+修改 `[instructions].files` 路径列表时，按正式流程编辑 `runner.toml`，先
+`check_runner_config`，再携带当前 generation 执行 `reload_runner_config`；无需重启
+Runner。文件内容本身始终是 live 的：直接修改 configured `AGENTS.md` 后，下一次
+`work_on_project` / 新 Project bootstrap 会重新读取，不需要 config reload。每个 Project
+bootstrap 都会独立观察当前 Runner-global instructions；v1 不做跨 Project context 去重。
+Runner-global source 被截断时保持有界，也不会因此开放 generic arbitrary-file `read_more`。
+
+
+Configured file 为空，或所有父目录均通过 ordinary-path 检查后确认末级文件缺失时，
+移除其 guidance。父目录缺失、发生重定向或无法读取，以及其他读取失败，均表示
+Runner scope 暂时不可用。从 `instructions.files` 移除条目并 reload 仍会明确撤销规则。
+显式恢复 Session 时，Runner 与 Project scope 独立更新；不可用的 scope
+只在内存中保留上一份规则。观察到新的 Runner instance 或 config generation 后，
+不会继承旧的全局规则。同一 instance 内，已知的较高 config generation 优先于请求
+开始顺序；未知 generation 不能替换已知 generation。Instance 替换按 live-instance
+验证顺序判断，迟到的旧 instance observation 不能恢复已撤销的 guidance。
+同一 instance/generation 内按请求 observation 顺序判断。Project 读取有独立的
+开始顺序 fence，不依赖 Runner 是否可用；迟到的 Project observation 保留较新的
+本地规则，并将 scan 标记为 incomplete。保留粒度是整个 scope，不是不完整 scope
+内的单个文件。规则正文与 observation fence 不会持久化到 Session records。
+
+32 Ki-character snapshot 会先为 Project-local 正文预留预算，再缩短全局正文；
+展示顺序仍为 global-before-project。Session retention 先选择各 scope，再应用共享
+预算。独立限于 32 Ki characters 的全局来源副本仅保留在 Session 内存中，因此保留
+较短的 Project scope，或后续本地正文缩短时，都能恢复之前被共享预算隐藏的全局正文。
+此来源副本与所有 observation fence 均不进入 public snapshot 或 summary。
+即使最终 startup byte budget 再次截断，Runner
+source 也不会获得 Project `read_file` continuation。`work_on_project` 始终重新观察
+instructions 与 change metadata，但 primary output 不投影 instruction 正文。显式
+`context_request=["project.instructions"]` 会同时观察当前 Runner 与 Project source
+并投影有界正文，不复用 Session 中保留的正文。
+Instruction projection 按共享 sidecar 的 20 KiB 剩余预算裁剪：先移除由正文派生的
+heading 索引，再缩短正文；保留 source identity 和 Project 规则，避免仅因新增全局
+source 就丢弃整份 context material。
+
+## ACP 编程代理：显式启动环境
+
+ACP 代理使用 Runner 启动时配置，子进程先清空环境（`env_clear()`），然后仅通过
+`env_from_env` 复制显式映射的变量。对于已安装的 npm `codex-acp` 适配器，使用其
+已安装可执行文件的绝对路径，并显式选择运行环境，例如：
+
+```toml
+[acp]
+max_concurrent_runs = 1
+
+[[acp.agents]]
+id = "codex"
+name = "Codex"
+executable = "/absolute/path/to/codex-acp"
+args = []
+env_from_env = { PATH = "PATH", HOME = "HOME" }
+```
+
+Runner 自身的 `PATH` 必须包含实际 Node 可执行文件。Homebrew 或 NVM 安装路径
+可能不在默认搜索目录内；映射 `PATH` 无法修复 Runner 自身不完整的环境。请用所需
+环境启动 Runner，修改配置或环境后重启 Runner。Desktop 编辑器提供 **添加缺少的
+PATH/HOME 映射** 操作：仅在用户选择时添加名称，并保留已有来源映射。
+
+`PATH` 和 `HOME` 只是起点，不能保证环境完整。需要用户配置/认证状态时显式映射
+`HOME`；使用自定义 Codex home 时映射 `CODEX_HOME`；按需映射 `HTTPS_PROXY`、
+`SSL_CERT_FILE` 或 `NODE_EXTRA_CA_CERTS` 等代理/证书变量。每个 source 必须存在
+于 Runner 环境，否则会在代理启动前失败。映射私密状态或凭据会将相应访问权限
+委托给该代理；变量值不会进入 Desktop 配置或 Server 通告。
+
+npm 适配器默认使用包内 Codex，它与系统 `codex` 命令不同。若通过 `CODEX_PATH`
+选择其他 Codex，必须显式添加 `CODEX_PATH = "CODEX_PATH"` 映射，并在 Runner
+环境中提供该 source。
+
+Linux 等价复现中，`codex-acp` **2.1.1** 搭配包内 Codex **0.159.3**，缺少 `PATH`
+时在 ACP `initialize` 之前以 **127** 退出；显式映射包含 Node 的 Runner `PATH`
+后初始化通过。这没有确定原报告者的环境，也未验证 macOS，不能据此认定所有
+启动失败均已解决。生命周期与配置边界见
+[ACP run contract](agent/acp-coding-agent-run.md#6-runner-owned-acp-provider-configuration)。
+
+## 本地 MCP provider
+
+Runner 可以直接托管供 WebCodex 内建 MCP gateway 使用的 persistent stdio MCP provider：
+
+```toml
+[mcp]
+request_timeout_secs = 30
+max_tool_description_bytes = 65536 # 默认 64 KiB
+
+[[mcp.providers]]
+id = "github"
+name = "GitHub"
+executable = "/absolute/path/to/github-mcp-server"
+args = []
+cwd = "/absolute/provider/workdir"
+env_from_env = { GITHUB_TOKEN = "GITHUB_TOKEN", PATH = "PATH", HOME = "HOME" }
+timeout_secs = 30
+```
+
+`max_tool_description_bytes` 是 Runner 侧可由用户配置的单工具 `description` 长度上限（默认 65,536 字节；有效范围 4,096–262,144 字节），同时用于 `tools/list` 与 `tools/call` 前的 schema 重新检查。Server 仍独立执行固定 256 KiB 单描述协议硬上限、完整 `tools/list` 1 MiB 消息上限，以及 Schema/工具数量限制。可在 Runner `[mcp]` 下设置，并通过 generation-fenced 配置重新加载生效，无需重启未变化的 provider；不会截断原始描述，也不会扩大模型展示预算。
+
+`executable` 与可选 `cwd` 都是 Runner host-local operator 配置并且必须为绝对路径；非法路径会 fail closed。`[mcp]` 现在参与正常的 generation-fenced Runner config reload transaction：配置未变化的 provider 保留 exact provider identity 和现有 connection；配置发生变化的 provider 获得新的 provider identity；新增/删除 provider 会在不重启 Runner 的情况下更新 routing。旧的 exact provider identity 会 fail closed，绝不会被静默 retarget。
+
+provider 不会整体继承 Runner 环境。`env_from_env` 只复制显式列出的变量，WebCodex 自己的 sensitive transport/account credential 变量不允许映射；配置的 source variable 缺失时会在 provider 启动前失败。Windows 上，Runner 在清空环境后会额外只提供非敏感的 `SYSTEMROOT` OS bootstrap（除非 operator 显式映射该 destination）；`PATH`、用户 profile 状态、代理与 credential 仍不会被整体继承。
+
+把 credential 映射给 provider，就等于把这份 credential 委托给该 provider process。provider 可以按自身实现使用它，也可以通过正常 tool result 返回派生值甚至原始值；WebCodex 不会尝试对任意 provider output 做 secret redaction。因此应把 configured provider 视为 credential recipient，使用 least-privilege provider credential，并注意任何拥有 `mcp:local` 权限的 caller 都能行使这些 credential 为 provider 提供的能力。
+
+provider connection 在第一次真实交互时启动，并在健康时复用。发生 fatal stdio/protocol failure 时只会退休当前 connection；WebCodex 绝不会重放刚才失败的 request。后续由 caller 明确发起的新 request 可以在同一逻辑 provider identity 下建立新 connection；effectful `tools/call` 在 dispatch 前仍会重新 `tools/list` 并核对已绑定 schema。Server 只看到逻辑 provider `id`/`name`，不会拿到 executable path、环境 value、PID、stderr 或 Runner credential。`mcp_tool(action=list)` 只表示 provider id 是否可路由。`mcp_tool(action=status, server=...)` 是纯 Runner-side lifecycle observation，不会启动、initialize 或 ping provider，只返回 `never_started`、`healthy`、`connection_retired` 或 `busy`。这里的 `healthy` 只表示当前保留 connection 的子进程仍在运行，不代表执行过端到端 MCP health probe。`list(server=...)` 与 `describe` 才会与 provider 交互。
+
+### Provider-side gateway V1 compatibility
+
+Runner 到 configured local provider 的内建 gateway 有意限制为 bounded stdio tool subset，并不是所有 MCP feature 的透明 bridge：
+
+- provider-side tool 行为基于 MCP `2025-06-18`；
+- 支持 `tools/list` 与 `tools/call`；
+- 不支持 callback、list pagination 与端到端 progress forwarding；
+- tool result 支持 text 以及标准的有界 image content block，并保持 provider `content` 原始顺序；image `data` 必须是 standard Base64，MIME 仅支持 `image/png`、`image/jpeg`、`image/webp`，单个 result 内全部 image block 合计 decoded data 上限为 4 MiB；
+- 有界 `structuredContent` 与 image content 独立原样保留；
+- audio、resource、`resource_link` 以及未知 content block type 仍不支持。
+
+不支持的 protocol/content shape 会 fail closed，而不是静默转换；该 gateway 仍是 bounded MCP tool subset，不是透明的 media/resource bridge。
+
+## Shell profile
+
+普通 Project Shell/Process 默认使用 `[shell] environment_mode = "inherit"`，继承
+启动 Runner 的 PATH、HOME/USERPROFILE 和工具链环境，继续过滤 WebCodex 内部凭据。
+Shell env 覆盖继承值，profile env 再覆盖 Shell env；未配置 init_script 时不执行
+启动脚本，也不会自动 source `.bashrc` / `.profile`。
+
+可显式选择 `environment_mode = "isolated"`：Unix 仅提供 `/usr/bin:/bin` PATH，
+Windows 提供 SystemRoot 与 System32 PATH，再应用配置 env/path_prepend。这不是文件系统沙箱。
+MCP 的显式 credential delegation 规则不变；Native Plugin 继续使用已有的凭据过滤。
+
+Windows structured process 支持 `.cmd`/`.bat`，由 Runner 内部转换 argv。支持空参数、
+空格、`&`、`|`、括号；双引号、`%`、`!`、`^`、控制字符和尾部反斜杠在启动前拒绝，
+命令上限为 8000 UTF-16 units；UNC cwd 会在启动前拒绝，避免 cmd.exe 静默切换工作目录。这些参数应改用 native runtime。进程树和 Job 契约不变。
+
+`read_files` 的精确单条目读取可读取 node_modules/target，普通搜索仍跳过它们，structured edit 仍拒绝。
+`.env*`、凭据、Runner 配置及 `.git` 控制数据继续保护。
+
+`runner.toml` 中的 Rust/Cargo 示例：
+
+```toml
+[shell]
+default_profile = "rust"
+
+[shell.profiles.rust]
+program = "sh"
+args = ["-c"]
+
+[shell.profiles.rust.env]
+PATH = "/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+CARGO_HOME = "/root/.cargo"
+RUSTUP_HOME = "/root/.rustup"
+```
+
+Python venv 示例：
+
+```toml
+[shell.profiles.py-venv]
+program = "bash"
+args = ["-lc"]
+init_script = '''
+source .venv/bin/activate
+'''
+```
+
+`init_script` 是项目相对路径：从项目根目录解析，因此每个项目激活自己的 venv。
+项目可以固定 profile：
+
+```toml
+id = "paper-exp"
+path = "/root/git/paper-exp"
+shell_profile = "conda-ml"
+```
+
+解析顺序：`project.shell_profile`，再 `shell.default_profile`，最后是普通 shell
+配置（不生成快照）。
+
+Profile 的安全要点：
+
+- 不要把令牌放进 `init_script`，也不要在其中 `echo` 密钥——脚本 stdout 会被
+  当作快照的一部分解析。
+- status 与 runtime API 只暴露脱敏的 profile 元数据（名称、`has_init_script`、
+  env 键数量、program、dialect）——绝不暴露 `init_script` 正文或环境值。
+- Profile 以清空环境 + 显式白名单运行；请声明所需 env。
+
+### `run_script` 的 typed 脚本语言
+
+`run_script` 接受 `sh`、`bash`、`powershell`、`javascript` 和 `typescript`。
+JavaScript 与 TypeScript 都由 Runner 上的外部 Node.js 执行。WebCodex 从准备好的
+shell/profile PATH 解析 `node`（仅当已配置的 shell/profile program 本身是
+`node`/`node.exe` 时也可直接使用）。JavaScript 正文写入 Runner-owned `.mjs`
+临时文件，并以 `node <temporary.mjs> <args...>` 的 native argv 形式启动；`.mjs`
+固定 ESM 语义，不受项目 `package.json` 或临时目录 metadata 影响。
+
+TypeScript 的定位是 typed-script runtime，不是项目编译器。Runner 将正文写入
+Runner-owned `.mts` 文件，因此入口始终采用 ESM，并使用 Node 原生的 erasable type
+stripping。最低支持 Node.js 22.6.0。创建或启动用户脚本之前，Runner 只执行一次有界的
+`node --version` capability probe：Node 22.6–22.17 与 Node 23.0–23.5 由 Runner
+固定加入 `--experimental-strip-types`；Node 22.18+、23.6+ 以及后续支持版本使用默认的
+native stripping，不再附加该 flag。Node 缺失、版本无法解析或低于 22.6 时返回
+`not_started` / `interpreter_unavailable`，用户脚本不会启动。如果版本 probe 已通过、
+但实际脚本进程之后拒绝某项 runtime semantics，则以实际已启动进程的 lifecycle 为准。
+
+该 TypeScript contract 覆盖 Node 能直接擦除的语法，例如 type annotations、interface /
+type alias、generics，以及普通 JavaScript 的 async/await、ESM、Node builtins。WebCodex
+不会执行 type checking，不会调用 `tsc`，不会把 `tsconfig.json` 当作项目构建配置，
+不会实现 tsconfig path alias，也不承诺 enum、parameter properties、runtime namespace、
+import alias 等需要 transform 的 TypeScript 语法。本 contract 也不使用
+`--experimental-transform-types`。在仍把 type stripping 标为 experimental 的旧版 Node
+上，Node 自己的 `ExperimentalWarning` 可能进入 stderr；WebCodex 不做 suppress/filter，
+以免同时吞掉用户脚本产生的 warning。
+
+滚动升级时，JavaScript 独立要求 `structured_script_javascript`，TypeScript 独立要求
+`structured_script_typescript`。这些 capability 只表示当前运行的 Runner binary 理解
+对应 typed-script wire semantics，并不表示本机一定有兼容 Node。脚本 args 继续作为
+literal native argv，stdin 继续独立传递，两种语言继续复用相同的 resolved project cwd、
+timeout/cancellation、Runner policy 和 Job lifecycle。
+
+WebCodex 不会安装或 bootstrap npm dependencies，不会注入 `node_modules` / `NODE_PATH`，
+不会选择 package manager，也不会 fallback 到 Bun、Deno、`tsx`、`npx` 或其他 runtime。
+由于 `.mjs` / `.mts` 入口位于 Runner-owned 临时目录，相对 ESM import 会相对于该临时
+module 解析，而不是 project cwd；导入项目代码时应使用 Node builtin 或显式项目路径/file URL。
+
+## Job 与并发
+
+Job 是在发起调用返回后仍继续运行的长命令或校验。Job 有稳定的 `job_id`、有界的
+stdout/stderr 尾部，并且可以停止。结构化执行（`run_process`、`run_script`）与
+校验 Job 会在单个执行超过同步宽限期时把同一执行交给 Job 延续；同一个进程继续
+运行——绝不会被重启。
+
+Runner 同时最多执行 `max_concurrent_jobs` 个 Job（默认 4，合法范围 1..64）。超出范围
+的值会作为配置错误被拒绝。这个参数用于运维调优，不是安全边界，修改需要重启 Runner：
+
+```toml
+max_concurrent_jobs = 4
+```
+
+当所有槽位都被占用时，已接受的 Job 仍是同一个可查询 Job（同一 `job_id`），并
+报告 `agent_queued`。
+
+## 传输细节
+
+### Server 的 QUIC 要求
+
+在 Server 上启用 QUIC listener 并打开所选 UDP 端口：
+
+```sh
+WEBCODEX_QUIC_ENABLED=true
+WEBCODEX_QUIC_LISTEN=0.0.0.0:8443
+WEBCODEX_QUIC_CERT=/etc/letsencrypt/live/<host>/fullchain.pem
+WEBCODEX_QUIC_KEY=/etc/letsencrypt/live/<host>/privkey.pem
+WEBCODEX_QUIC_ALPN=webcodex-runner/1
+```
+
+证书 SAN 必须匹配 Runner 上配置的 `server_name`。配置了 `[quic]` 时 `auto` 先试
+QUIC，再 WebSocket，最后 polling。
+
+### Runner 的出站代理
+
+如果 Runner 主机需要出站 HTTP 代理，请把代理变量放进 Runner 的服务环境，而不仅
+是交互 shell。WebSocket 遵循 `HTTPS_PROXY`/`https_proxy`、再
+`HTTP_PROXY`/`http_proxy`、再 `ALL_PROXY`/`all_proxy`；`NO_PROXY`/`no_proxy`
+可绕过匹配主机。当前支持的代理传输是 `http://host:port` 的 HTTP `CONNECT`。
+QUIC 不使用代理设置。
+
+## 重连与恢复
+
+Runner 断连是 liveness 事实，不等于工作丢失。已接受的活跃 Job 会进入有界的
+`recovering` 状态（默认宽限 120 秒），并在同一 Runner 实例重连后从其 inventory
+恢复。替换的 Runner 实例不会继承旧实例的 Job；它们会变成 `lost`。Runner 进程重启
+无法恢复其旧的子进程。
+
+Server 会把稳定的 Runner `client_id` 与当前 live process lease 分开。stale/replacement process 不能继续使用旧 lease 提交结果，普通 child-process Job 也不会被 replacement Runner 接管。精确 lease identifier 属于内部 wire detail。
+
+重连以短延迟自动进行。`auto` 降级到 polling 后不会永久停留：30 秒后，在没有未完成 HTTP dispatch 的安全边界重试首选流式传输（已配置的 QUIC，然后 WebSocket）。HTTP dispatch 忙时继续 polling，避免阻断存活检测和控制请求；正在运行的 Job 不等待结束、不重启。流式连接失败则继续 polling。网络超时、注册超时和退避也计入恢复耗时，因此 30 秒不是端到端恢复时限。显式 `polling` 仍保持 polling，显式 `websocket` 则持续重试 WebSocket。
+
+Runner 准入和 Server inventory 校验共用语义 shell 合同，包含 `python`，不接受 `python3` 等具体解释器名称作为语义身份。普通 Job 的开始、结束时间保证不早于因果上的前一个时间戳，覆盖启动、终态以及准入阶段直接拒绝；执行耗时仍独立测量，避免跨主机时钟偏差把正常执行后的 inventory 判为无效。
+
+注册明确返回 `job inventory shell is invalid` 或 `job inventory timestamps are inconsistent` 时，保留同一 Runner 实例和完整 Job inventory，以有界退避重试，不通过清空 active inventory 换取注册成功。持续拒绝仍需调查或更新有缺陷的组件；重试本身不代表已恢复。认证、身份/归属、协议及其他致命错误仍严格停止 Runner。操作系统 supervisor 应保持启用，但它重启进程不能代替同进程的 Job 恢复。
+
+不要在普通 `run_shell` Job 内用 `nohup ... &` 把 Runner watchdog 当作永久服务启动：普通执行在父命令结束后仍会清理其托管进程树，后台运行和重定向输出不构成执行所有权转移。Runner/watchdog 应交给该 Job 进程树之外的服务管理器。`run_detached_process` 是另一套有总生命周期上限的原生执行合同，不是无限期 shell 服务安装器。
+
+Server-only 重启恢复不等于持久化执行：普通 active Job 依靠存活 Runner 的 inventory 重建。Server 内存中的待分发请求、历史结果 receipt 或持久化 Workflow Session 都不构成可自动重放命令的持久队列。隔离端到端验收覆盖运行中任务、离线完成、`run_process`、Python `run_script`、validation handoff，以及原 Job 身份、日志连续性和副作用不重复：
+
+```sh
+E2E_RUNNER_TRANSPORT=auto E2E_TIMEOUT_SECS=900 bash scripts/e2e_job_reconciliation_ws.sh
+```
+
+验收使用临时端口、令牌、目录和进程，默认构建 `dogfood` profile，不会重启已部署服务。
+
+## 关停与重启
+
+`webcodex-runner` 在 `SIGINT`/`SIGTERM` 时干净关停。它不会自行 daemonize。
+托管部署请用 `webcodex runner install --scope user|system` 把它安装并托管为
+user 或 system 服务，并把令牌放进服务环境。
+
+机器重启后，hosted `connect` profile 通过重新运行 `webcodex connect` 或
+`webcodex runner start --profile <profile>` 来恢复。hosted profile 暂不支持开机自动
+启动。
+
+## SSH 会话资源（高级）
+
+本地 OpenSSH 客户端可用时，Runner 会声明 `ssh_shell` capability。Workflow
+Session 可以选择命名的 SSH 资源，使 `run_shell` 与 `run_job` 在 Unix 和 Windows
+上都通过 Runner 自己的 OpenSSH 客户端在远程主机执行。Unix 可以复用 Runner 本地
+ControlMaster 传输；Windows 的每次 one-shot/background 执行都会启动一个直接的
+`ssh.exe`，不使用 `ControlMaster`、`ControlPersist` 或 `-S`。独立的
+`ssh_persistent_shell` capability 允许同一资源用于 `open_session_shell`：Unix
+可以复用 mux，Windows 则拥有一个直接的长生命周期 `ssh.exe` channel。 这些 SSH resource 语义不意味着 PTY/ConPTY 或额外的终端控制协议。
+
+```toml
+[ssh.resources.tmp]
+host = "tmp"
+default_cwd = "/opt/webcodex-edge"
+```
+
+`host` 值会传给 Runner 机器的 OpenSSH 客户端，因此 `~/.ssh/config`、密钥、
+`ssh-agent`、`ProxyJump` 等配置都留在该机器上。不要把凭据、私钥或完整 SSH 配置
+放进 Session 数据、Server 存储或工具输入。Session 的 `execution_context.resource`
+会让 `run_shell`、`run_job` 以及受支持的 `open_session_shell` 调用通过该资源执行；
+文件、Git、LSP 工具仍在本地。配置 reload 后，后续命令绑定当前 resource
+generation；已经启动的 SSH 命令继续自己的有界生命周期，不会被重定向、replay
+或盲目重试。
+
+有权限的模型 client 也可以通过 MCP `manage_ssh_resource` 工具登记 Runner-local SSH
+resource。`list` 只返回安全的逻辑名称、`static|managed`、active/pending-restart 状态，
+以及绑定 exact Runner 与 registry revision 的 opaque binding。`register` 接受一个用户
+明确提供的 OpenSSH destination argv 与可选 default cwd；`remove` 只删除 managed
+desired state。工具不会返回 raw target、用户名、地址、SSH option、credential 或
+identity path。静态 `[ssh.resources.*]` 名称始终 reserved，不能通过这条路径覆盖或删除。
+
+Managed mutation 修改的是 durable desired state，不是当前进程的 live config。返回
+`restart_required=true` 时，需要重启该 Runner，再次 `list` 后才能把资源绑定到
+Workflow Session。已经与 frozen startup snapshot 一致的幂等操作可以返回
+`restart_required=false`。访问还需要独立的可选 `ssh:local` permission；hosted OAuth
+client 通过 `webcodex connect ... --oauth-local-ssh` 显式 opt in。
+
+Managed target 最终仍由现有 SSH transport 消费。因此，成功登记 Windows OpenSSH
+destination 不代表一定能建立 PersistentShell：当前 remote persistent-shell contract
+仍要求远端已有 `sh`/`bash`。Remote PowerShell PersistentShell 不属于本能力。
+
+## LSP 导航（只读）
+
+Runner 可以通过在仓库机器上运行的语言服务器提供只读语义导航：
+
+| 语言 | 服务器 | 标记 |
+| --- | --- | --- |
+| Rust | `rust-analyzer` | `Cargo.toml` |
+| Go | `gopls` | `go.mod`、`go.work` |
+| Python | `pyright` | `pyproject.toml`、`setup.py`、`requirements.txt`、… |
+| TypeScript / JavaScript | `typescript-language-server` | `tsconfig.json`、`package.json`、… |
+
+工具包括 `get_lsp_status`、`list_document_symbols`、`find_definition`、
+`find_references`、`read_document_diagnostics`、`hover` 与 `list_workspace_symbols`。
+独立的 `read_call_hierarchy` 操作在 Runner 内完成 prepare 以及有界的
+incoming/outgoing 广度优先遍历；canonical Connector 将其投影为 `code_impact`，
+不会暴露原始协议方法或不透明 LSP item data。
+它们只读、project-bound，并且被约束为启动语言服务器绝不执行仓库代码或拉取依赖。
+路径是项目相对路径；外部/依赖位置会被省略。语言服务器必须安装在 Runner 机器上，
+或通过 `WEBCODEX_RUST_ANALYZER`、`WEBCODEX_GOPLS` 等 env override 指定。gopls
+profile 还会关闭 module/toolchain 网络访问并使用 `-mod=readonly`；WebCodex 不会为语义
+导航自动安装 gopls，也不会拉取缺失的 Go 依赖。
+
+Call hierarchy 必须由独立的 `lsp_call_hierarchy` capability 声明，且所选语言服务器
+必须提供 `callHierarchyProvider`。缺少支持会显式失败，不回退到 grep、AST、shell
+或 references。
+
+## 运维 Runner
+
+最简命令：
+
+```bash
+webcodex runner status --profile <profile>
+webcodex runner logs --profile <profile> --lines 100
+webcodex runner restart --profile <profile>
+```
+
+用户服务：
+
+```bash
+webcodex runner install --scope user --config <login-reported-runner-config>
+webcodex runner status --scope user --config <login-reported-runner-config>
+```
+
+管理员管理的系统服务：
+
+```bash
+sudo webcodex runner install --scope system --profile <profile> \
+  --user <runner-user> --working-directory /home/<runner-user>
+sudo webcodex runner status --scope system --profile <profile>
+```
+
+install、status、start、stop、restart、logs、uninstall 请使用相同的 `--scope`。
+User scope 使用 `systemctl --user`；system scope 使用 `/etc/systemd/system`。
+
+对已经运行的 Runner，修改配置时使用正式的 first-class 流程，不再查 PID 或手工发信号：
+
+1. 编辑该 Runner 启动时绑定的现有 `runner.toml`。
+2. 调用 `check_runner_config(client_id=...)`。它只读取这个绑定路径，不激活 candidate，
+   返回当前 generation 以及有界的 validation/restart 元数据。
+3. candidate 有效后调用
+   `reload_runner_config(client_id=..., expected_generation=<current_generation>)`。
+   optimistic generation fence 会在激活前拒绝 stale caller。
+4. reload 后调用 `get_runtime_status(client_id=...)`（或 `list_runners`）检查当前运行状态。
+
+`reload_runner_config` 不写 `runner.toml`，只激活磁盘上已经存在的 candidate。policy、
+shell、configured Skill roots、configured instruction files、Native Plugin 与静态 SSH resource
+中可热加载的字段可以立即生效；`restart_required_fields`
+报告的字段仍保持 startup-only，重启前不会假装已在线生效。无效 candidate 保留旧 active
+snapshot 与 generation。`ssh_resource` managed mutation 不同：它使用 frozen startup
+snapshot，且只在工具返回 `restart_required=true` 时要求重启 Runner。
+
+Plugin 配置通过与 `plugin_tool reload` 相同的 validated candidate admission/commit primitive
+进行 live apply，因此修改 `[plugins]` 不属于 restart-only 变更。只想 reload Plugin state 时，
+仍使用权限更窄、要求 `plugin:manage` 的 `plugin_tool reload`。
+
+Unix 上 service reload/SIGHUP 仍可作为兼容 trigger，并调用同一个 authoritative reload
+primitive。Windows 与 macOS 直接使用 first-class operation，不模拟信号，也不需要 PID
+管理。对于可安全分类的 validation failure，config operation 只报告闭集、非 secret 的
+原子信息，例如 `field=max_concurrent_jobs` 与 `reason=out_of_range`；不会投影 raw TOML、
+配置值、路径、credential、parser 文本或 shell environment value。

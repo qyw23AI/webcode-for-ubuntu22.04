@@ -1,0 +1,314 @@
+import json
+import os
+import stat
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from scripts import release_plan as plan
+from scripts import release_publication as publication
+
+
+SOURCE = "a" * 40
+VERSION = "0.4.0"
+TAG = f"v{VERSION}"
+SOURCE_REF = f"release/v{VERSION}"
+
+
+def _state(root: Path, *, phase: str) -> dict:
+    work = root / "work"
+    work.mkdir(exist_ok=True)
+    now = 1_900_000_000
+    state = {
+        "schema_version": plan.STATE_SCHEMA_VERSION,
+        "require_runtime_installers": False,
+        "require_unified_installers": True,
+        "kind": plan.KIND,
+        "repo": "yyjeqhc/webcodex",
+        "version": VERSION,
+        "tag": TAG,
+        "source_ref": SOURCE_REF,
+        "source_sha": SOURCE,
+        "root": str(root.absolute()),
+        "work_dir": str(work.absolute()),
+        "readiness_state_file": str((work / "readiness.json").absolute()),
+        "build_state_file": str((work / "build.json").absolute()),
+        "bundle_dir": str((work / "bundle").absolute()),
+        "stage_dir": str((work / "npm-stage").absolute()),
+        "phase": phase,
+        "created_at": now,
+        "updated_at": now,
+        "readiness_run_id": None,
+        "build_run_id": None,
+        "last_action": "test",
+    }
+
+    if phase in {plan.PHASE_BUILD_PASSED, plan.PHASE_BUNDLE, plan.PHASE_NPM_STAGED,
+                 plan.PHASE_AWAIT_DRAFT, plan.PHASE_DRAFT_VERIFIED, plan.PHASE_AWAIT_PUBLICATION}:
+        from scripts.tests.test_release_publication import _state as build_fixture
+        build = build_fixture()
+        build.update(tag=TAG, include_unified_installers=True,
+                     run_name=publication._build_run_name(TAG, build["request_id"]))
+        publication._write_state(Path(state["build_state_file"]), build)
+    return state
+
+
+class ReleasePlanStateTests(unittest.TestCase):
+    def test_state_round_trip_is_mode_0600_and_rejects_symlink(self) -> None:
+        # Current state schema carries the exact release source branch.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            state_path = root / "state.json"
+            plan._write_state(state_path, _state(root, phase=plan.PHASE_PREFLIGHT))
+            loaded = plan._load_state(state_path)
+            self.assertEqual(loaded["phase"], plan.PHASE_PREFLIGHT)
+            self.assertEqual(loaded["source_ref"], SOURCE_REF)
+            if os.name != "nt":
+                self.assertEqual(stat.S_IMODE(state_path.stat().st_mode), 0o600)
+            state_path.unlink()
+            target = root / "target.json"
+            target.write_text("{}\n", encoding="utf-8")
+            state_path.symlink_to(target)
+            with self.assertRaises(plan.ReleasePlanError):
+                plan._load_state(state_path)
+
+    def test_legacy_state_migrates_to_main_source_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            state = _state(root, phase=plan.PHASE_PREFLIGHT)
+            state["schema_version"] = plan.LEGACY_STATE_SCHEMA_VERSION
+            state.pop("source_ref")
+            state.pop("require_unified_installers"); state.pop("require_runtime_installers")
+            state_path = root / "legacy.json"
+            plan._write_state(state_path, state)
+            loaded = plan._load_state(state_path)
+            self.assertEqual(loaded["schema_version"], plan.STATE_SCHEMA_VERSION)
+            self.assertEqual(loaded["source_ref"], "main")
+
+    def test_schema_two_retains_legacy_requirement_and_schema_three_rejects_missing_or_nonboolean(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / "state.json"
+            state = _state(root, phase=plan.PHASE_PREFLIGHT)
+            state["schema_version"] = 2
+            state.pop("require_unified_installers"); state.pop("require_runtime_installers")
+            plan._write_state(path, state)
+            self.assertFalse(plan._load_state(path)["require_unified_installers"])
+            state["schema_version"] = plan.STATE_SCHEMA_VERSION
+            plan._write_state(path, state)
+            with self.assertRaises(plan.ReleasePlanError):
+                plan._load_state(path)
+            state["require_unified_installers"] = "true"
+            plan._write_state(path, state)
+            with self.assertRaises(plan.ReleasePlanError):
+                plan._load_state(path)
+
+    def test_schema_three_preserves_explicit_false_for_operator_owned_plan(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); path = root / "state.json"
+            state = _state(root, phase=plan.PHASE_PREFLIGHT)
+            state["require_unified_installers"] = False
+            plan._write_state(path, state)
+            self.assertFalse(plan._load_state(path)["require_unified_installers"])
+
+    def test_init_runs_preflight_once_and_records_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            state_path = root / "state.json"
+            work = root / "release-work"
+            with mock.patch.object(publication, "preflight_release", return_value={"version": VERSION}) as preflight:
+                summary = plan.init_plan(
+                    repo="yyjeqhc/webcodex",
+                    version=VERSION,
+                    source_sha=SOURCE,
+                    source_ref=SOURCE_REF,
+                    root=root,
+                    state_file=state_path,
+                    work_dir=work,
+                    timeout=30.0,
+                )
+            preflight.assert_called_once()
+            loaded = plan._load_state(state_path)
+            self.assertEqual(loaded["phase"], plan.PHASE_PREFLIGHT)
+            self.assertEqual(Path(loaded["work_dir"]), work.absolute())
+            self.assertEqual(summary["status"], "ready")
+            self.assertTrue(loaded["require_unified_installers"])
+            self.assertEqual(summary["source_ref"], SOURCE_REF)
+            self.assertEqual(preflight.call_args.kwargs["source_ref"], SOURCE_REF)
+
+
+class ReleasePlanStatusTests(unittest.TestCase):
+    def test_status_preserves_durable_wait_failure_reconciliation_and_authorization(self) -> None:
+        cases = (
+            (plan.PHASE_READINESS, "readiness_waiting", "waiting"),
+            (plan.PHASE_READINESS, "readiness_failed", "failed"),
+            (plan.PHASE_BUILD, "build_failed", "failed"),
+            (plan.PHASE_BUNDLE, "stage_requires_reconciliation", "needs_reconciliation"),
+            (plan.PHASE_AWAIT_TAG, "awaiting_tag_authorization", "needs_authorization"),
+            (plan.PHASE_PREFLIGHT, "preflight_passed", "ready"),
+        )
+        for phase, last_action, expected_status in cases:
+            with self.subTest(phase=phase, last_action=last_action):
+                with tempfile.TemporaryDirectory() as temp:
+                    root = Path(temp)
+                    state = _state(root, phase=phase)
+                    state["last_action"] = last_action
+                    state_path = root / "state.json"
+                    plan._write_state(state_path, state)
+                    summary = plan.status_plan(state_file=state_path)
+                    self.assertEqual(summary["status"], expected_status)
+                    if expected_status == "ready":
+                        self.assertNotIn("next_action", summary)
+                    else:
+                        self.assertIn("next_action", summary)
+
+
+class ReleasePlanResumeTests(unittest.TestCase):
+    def _write(self, root: Path, phase: str) -> Path:
+        path = root / "state.json"
+        plan._write_state(path, _state(root, phase=phase))
+        return path
+
+    def test_existing_readiness_state_is_recovered_without_redispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            state_path = self._write(root, plan.PHASE_PREFLIGHT)
+            nested = Path(plan._load_state(state_path)["readiness_state_file"])
+            nested.write_text("placeholder", encoding="utf-8")
+            with (
+                mock.patch.object(plan.readiness, "start_readiness") as start,
+                mock.patch.object(plan.readiness, "status_readiness", return_value=({"run_id": 33}, 2)) as status,
+            ):
+                summary, code = plan.resume_plan(state_file=state_path, timeout=30.0, wait_secs=0)
+            self.assertEqual(code, 2)
+            self.assertEqual(summary["status"], "waiting")
+            start.assert_not_called()
+            status.assert_called_once()
+            self.assertEqual(plan._load_state(state_path)["phase"], plan.PHASE_READINESS)
+
+    def test_awaiting_tag_is_explicit_authorization_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            state_path = self._write(root, plan.PHASE_AWAIT_TAG)
+            with mock.patch.object(plan, "_tag_source", return_value=None):
+                summary, code = plan.resume_plan(state_file=state_path, timeout=30.0, wait_secs=0)
+            self.assertEqual(code, 3)
+            self.assertEqual(summary["status"], "needs_authorization")
+            self.assertIn("create and push annotated", summary["next_action"])
+
+    def test_existing_tag_advances_to_one_bound_build_and_waits(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            state_path = self._write(root, plan.PHASE_AWAIT_TAG)
+            with (
+                mock.patch.object(plan, "_tag_source", return_value=SOURCE),
+                mock.patch.object(publication, "start_build", return_value=({"run_id": 44, "include_unified_installers": True}, 0)) as start,
+                mock.patch.object(publication, "status_build", return_value=({"run_id": 44, "include_unified_installers": True}, 2)) as status,
+            ):
+                summary, code = plan.resume_plan(state_file=state_path, timeout=30.0, wait_secs=0)
+            self.assertEqual(code, 2)
+            self.assertEqual(summary["status"], "waiting")
+            self.assertEqual(plan._load_state(state_path)["build_run_id"], 44)
+            start.assert_called_once()
+            self.assertTrue(start.call_args.kwargs["include_unified_installers"])
+            status.assert_called_once()
+
+    def test_existing_build_state_is_recovered_without_redispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            state_path = self._write(root, plan.PHASE_AWAIT_TAG)
+            nested = Path(plan._load_state(state_path)["build_state_file"])
+            nested.write_text("placeholder", encoding="utf-8")
+            with (
+                mock.patch.object(plan, "_tag_source", return_value=SOURCE),
+                mock.patch.object(publication, "start_build") as start,
+                mock.patch.object(publication, "status_build", return_value=({"run_id": 44, "include_unified_installers": True}, 2)) as status,
+            ):
+                summary, code = plan.resume_plan(state_file=state_path, timeout=30.0, wait_secs=0)
+            self.assertEqual(code, 2)
+            self.assertEqual(summary["status"], "waiting")
+            start.assert_not_called()
+            status.assert_called_once()
+            self.assertEqual(plan._load_state(state_path)["phase"], plan.PHASE_BUILD)
+
+    def test_strict_plan_refuses_reused_core_only_or_legacy_build_without_redispatch(self):
+        for selection in (False, None):
+            with self.subTest(selection=selection), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                state_path = self._write(root, plan.PHASE_AWAIT_TAG)
+                nested = Path(plan._load_state(state_path)["build_state_file"])
+                nested.write_text("placeholder")
+                summary = {"run_id": 44}
+                if selection is not None:
+                    summary["include_unified_installers"] = selection
+                with mock.patch.object(plan, "_tag_source", return_value=SOURCE), \
+                     mock.patch.object(publication, "start_build") as start, \
+                     mock.patch.object(publication, "status_build", return_value=(summary, 0)), \
+                     mock.patch.object(plan.collector, "collect_bundle") as collect:
+                    with self.assertRaisesRegex(plan.ReleasePlanError, "did not request required unified installers"):
+                        plan.resume_plan(state_file=state_path, timeout=5, wait_secs=0)
+                start.assert_not_called(); collect.assert_not_called()
+                self.assertEqual(plan._load_state(state_path)["phase"], plan.PHASE_BUILD)
+
+    def test_strict_plan_rechecks_old_nested_selection_after_build_was_recorded_successful(self):
+        for phase in (plan.PHASE_BUILD_PASSED, plan.PHASE_AWAIT_PUBLICATION):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp); path = self._write(root, phase)
+                nested = Path(plan._load_state(path)["build_state_file"])
+                build = publication._load_state(nested)
+                build["schema_version"] = 1; build.pop("include_unified_installers"); build.pop("include_runtime_installers")
+                publication._write_state(nested, build)
+                with mock.patch.object(plan.collector, "collect_bundle") as collect:
+                    with self.assertRaisesRegex(plan.ReleasePlanError, "did not request required unified installers"):
+                        plan.resume_plan(state_file=path, timeout=5, wait_secs=0)
+                collect.assert_not_called()
+
+    def test_successful_build_collects_and_stages_then_pauses_for_draft(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            state = _state(root, phase=plan.PHASE_BUILD_PASSED)
+            state["build_run_id"] = 55
+            state_path = root / "state.json"
+            plan._write_state(state_path, state)
+            with (
+                mock.patch.object(collector := plan.collector, "collect_bundle", return_value={"source_sha": SOURCE, "tag": TAG}) as collect,
+                mock.patch.object(publication, "stage_npm", return_value={"npm_smoke": "passed"}) as stage,
+                mock.patch.object(
+                    publication,
+                    "verify_draft_assets",
+                    side_effect=publication.PublicationError(f"GitHub draft Release was not found for tag: {TAG}"),
+                ) as draft,
+            ):
+                summary, code = plan.resume_plan(state_file=state_path, timeout=30.0, wait_secs=0)
+            self.assertEqual(code, 3)
+            self.assertEqual(summary["phase"], plan.PHASE_AWAIT_DRAFT)
+            collect.assert_called_once()
+            stage.assert_called_once()
+            self.assertTrue(collect.call_args.kwargs["require_unified_installers"])
+            self.assertTrue(stage.call_args.kwargs["require_unified_installers"])
+            self.assertTrue(draft.call_args.kwargs["require_unified_installers"])
+
+    def test_unrecorded_existing_stage_fails_closed_for_reconciliation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            state_path = self._write(root, plan.PHASE_BUNDLE)
+            Path(plan._load_state(state_path)["stage_dir"]).mkdir()
+            summary, code = plan.resume_plan(state_file=state_path, timeout=30.0, wait_secs=0)
+            self.assertEqual(code, 4)
+            self.assertEqual(summary["status"], "needs_reconciliation")
+
+    def test_verified_draft_pauses_before_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            state_path = self._write(root, plan.PHASE_AWAIT_DRAFT)
+            with mock.patch.object(publication, "verify_draft_assets", return_value={"draft": True}) as verify:
+                summary, code = plan.resume_plan(state_file=state_path, timeout=30.0, wait_secs=0)
+            self.assertEqual(code, 3)
+            self.assertEqual(summary["phase"], plan.PHASE_AWAIT_PUBLICATION)
+            self.assertIn("publish the verified GitHub draft", summary["next_action"])
+            verify.assert_called_once()
+
+
+if __name__ == "__main__":
+    unittest.main()

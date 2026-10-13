@@ -1,0 +1,10 @@
+# Downloaded release archives and metadata
+*downloads/
+
+# Installed and runtime files
+*installed/
+*runtime/
+
+# Python bytecode caches
+__pycache__/
+*.py[cod]
